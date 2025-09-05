@@ -571,6 +571,8 @@ void PollBackendCommands()
             string action = ExtractJSONValue(obj, "action");
             if(StringFind(action, "close") >= 0 || StringFind(action, "CLOSE") >= 0)
                 ExecuteCloseCommand(obj);
+            else if(StringFind(StringToLower(action), "status") >= 0)
+                SendOrdersStatus();
             else
                 ExecuteTradeCommand(obj);
         }
@@ -626,5 +628,45 @@ void SendCloseConfirmation(int ticket, string symbol, string side, double lots, 
 	if(res == -1)
 	{
 		Print("❌ Close confirmation WebRequest failed: ", GetLastError());
+	}
+}
+
+void SendOrdersStatus()
+{
+	string lines = "";
+	int count = 0;
+	for(int i = 0; i < OrdersTotal(); i++)
+	{
+		if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+		string side = (OrderType() == OP_BUY) ? "BUY" : "SELL";
+		string comment = OrderComment();
+		lines += StringFormat("#%d | %s %s %.2f | open: %.*f | strat: %s\n",
+			OrderTicket(), OrderSymbol(), side, OrderLots(), (int)MarketInfo(OrderSymbol(), MODE_DIGITS), OrderOpenPrice(), comment);
+		count++;
+	}
+	if(count == 0) lines = "(no active orders)";
+
+	// Build ORDERS_STATUS payload
+	string json = "{";
+	json += "\"token\":\"" + Api_Auth_Token + "\",";
+	json += "\"symbol\":\"\","; // not required
+	json += "\"timeframe\":0,";
+	json += "\"side\":\"\",";
+	json += "\"strategy\":\"ORDERS_STATUS\",";
+	json += "\"price\":0,";
+	json += "\"ref1\":0,";
+	json += "\"ref2\":0,";
+	json += "\"reason\":\"" + lines + "\",";
+	json += "\"timestamp\":" + IntegerToString((int)TimeCurrent());
+	json += "}";
+
+	char post[]; StringToCharArray(json, post);
+	char result[]; string result_headers = "";
+	ResetLastError();
+	string url = Backend_Base_URL + "/signal";
+	int res = WebRequest("POST", url, "", "", 10000, post, ArraySize(post), result, result_headers);
+	if(res == -1)
+	{
+		Print("❌ Orders status WebRequest failed: ", GetLastError());
 	}
 }

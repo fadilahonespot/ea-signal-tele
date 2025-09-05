@@ -587,10 +587,12 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 	case "ignore":
 		answerCallbackQuery(callback.ID, "Signal ignored")
 		log.Printf("🚫 Signal ignored by user")
+		_ = removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID)
 
 	case "keep":
 		answerCallbackQuery(callback.ID, "Order will remain open")
 		log.Printf("⏳ Keep order open selected by user")
+		_ = removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID)
 	}
 }
 
