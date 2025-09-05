@@ -208,11 +208,15 @@ func sendCloseToMT4(ticket int, symbol string) error {
 	return nil
 }
 
-func enqueueClose(ticket int, symbol string) {
+func enqueueClose(ticket int, symbol string, strategy string) {
 	queueMu.Lock()
 	defer queueMu.Unlock()
-	commandQueue = append(commandQueue, TradeCommand{Action: "close", Ticket: ticket, Symbol: symbol})
-	log.Printf("📥 Enqueued close for HTTP bridge: ticket #%d", ticket)
+	commandQueue = append(commandQueue, TradeCommand{Action: "close", Ticket: ticket, Symbol: symbol, Strategy: strategy})
+	if strategy != "" {
+		log.Printf("📥 Enqueued close for HTTP bridge: ticket #%d strategy=%s", ticket, strategy)
+	} else {
+		log.Printf("📥 Enqueued close for HTTP bridge: ticket #%d", ticket)
+	}
 }
 
 // ============ MT4 BRIDGE FUNCTIONS ============
@@ -355,7 +359,8 @@ func signalHandler(w http.ResponseWriter, r *http.Request) {
 			p.Symbol, actualSide, p.Strategy, p.Price, p.Ref1, p.Reason, ts,
 		)
 
-		closeData := fmt.Sprintf("%s|%.0f", p.Symbol, p.Ref2) // Ref2 = ticket
+		actualStrategy := strings.TrimPrefix(p.Strategy, "CLOSE_")
+		closeData := fmt.Sprintf("%s|%.0f|%s", p.Symbol, p.Ref2, actualStrategy) // Ref2 = ticket
 		buttons = &TelegramInlineKeyboard{
 			InlineKeyboard: [][]TelegramInlineButton{
 				{
@@ -507,8 +512,12 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 		if len(parts) >= 3 {
 			symbol := parts[1]
 			ticket, _ := strconv.ParseFloat(parts[2], 64)
+			actualStrategy := ""
+			if len(parts) >= 4 {
+				actualStrategy = parts[3]
+			}
 
-			log.Printf("🔴 CLOSE request: ticket=%.0f symbol=%s", ticket, symbol)
+			log.Printf("🔴 CLOSE request: ticket=%.0f symbol=%s strategy=%s", ticket, symbol, actualStrategy)
 
 			if err := sendCloseToMT4(int(ticket), symbol); err != nil {
 				answerCallbackQuery(callback.ID, "❌ Close failed")
@@ -518,7 +527,7 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 				sendTelegram(fmt.Sprintf("🔴 Close order #%.0f", ticket))
 				log.Printf("✅ Close command dispatched to MT4")
 			}
-			enqueueClose(int(ticket), symbol)
+			enqueueClose(int(ticket), symbol, actualStrategy)
 		}
 
 	case "ignore":

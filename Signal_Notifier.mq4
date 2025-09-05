@@ -57,12 +57,17 @@ int OnInit()
 {
     Print("Signal Notifier EA started. Add backend base URL to MT4 WebRequest whitelist: ", Backend_Base_URL);
 
-    // Setup health ping timer if enabled
-    if(Enable_Health_Ping && Health_Ping_Interval_Sec > 0)
+    // Setup timer if either health ping or HTTP command polling is enabled
+    int timerSec = 0;
+    if(Enable_Health_Ping && Health_Ping_Interval_Sec > 0) timerSec = Health_Ping_Interval_Sec;
+    if(Enable_HTTP_Command_Poll && HTTP_Command_Poll_Interval_Sec > 0)
     {
-        // EventSetTimer uses seconds
-        EventSetTimer(Health_Ping_Interval_Sec);
-        Print("Health ping enabled every ", Health_Ping_Interval_Sec, "s to ", Backend_Base_URL, "/health");
+        if(timerSec == 0 || HTTP_Command_Poll_Interval_Sec < timerSec) timerSec = HTTP_Command_Poll_Interval_Sec;
+    }
+    if(timerSec > 0)
+    {
+        EventSetTimer(timerSec);
+        Print("Timer enabled every ", timerSec, "s (health=", Enable_Health_Ping, ", cmd=", Enable_HTTP_Command_Poll, ")");
     }
     return(INIT_SUCCEEDED);
 }
@@ -72,9 +77,8 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-    // Kill timer if set
-    if(Enable_Health_Ping && Health_Ping_Interval_Sec > 0)
-        EventKillTimer();
+    // Kill timer
+    EventKillTimer();
 
     Print("Signal Notifier EA stopped");
 }
@@ -117,31 +121,28 @@ void OnTick()
 //+------------------------------------------------------------------+
 void OnTimer()
 {
-    if(!Enable_Health_Ping) return;
-    if(Health_Ping_Interval_Sec <= 0) return;
-
-    // Prepare empty body
-    char post[]; ArrayResize(post, 0);
-    char result[];
-    string result_headers = "";
-
-    ResetLastError();
-    // Health URL derived from base URL
-    string healthUrl = Backend_Base_URL + "/health";
-    int res = WebRequest("GET", healthUrl, "", "", 5000, post, ArraySize(post), result, result_headers);
-    if(res == -1)
+    // Health ping (optional)
+    if(Enable_Health_Ping && Health_Ping_Interval_Sec > 0)
     {
-        int err = GetLastError();
-        Print("Health ping failed ", err, ". Ensure URL is allowed in MT4 settings: ", healthUrl);
-        return;
+        char post[]; ArrayResize(post, 0);
+        char result[]; string result_headers = "";
+        ResetLastError();
+        string healthUrl = Backend_Base_URL + "/health";
+        int res = WebRequest("GET", healthUrl, "", "", 5000, post, ArraySize(post), result, result_headers);
+        if(res == -1)
+        {
+            int err = GetLastError();
+            Print("Health ping failed ", err, ". Ensure URL is allowed in MT4 settings: ", healthUrl);
+        }
+        else
+        {
+            string resp = CharArrayToString(result, 0, -1);
+            Print("Health OK resp=", resp);
+        }
     }
 
-    string resp = CharArrayToString(result, 0, -1);
-    // Keep logs concise; only print brief success message
-    Print("Health OK resp=", resp);
-
     // Poll HTTP commands if enabled and interval elapsed
-    if(Enable_HTTP_Command_Poll && HTTP_Command_Poll_Interval_Sec > 0 && StringLen(Backend_Commands_URL) > 0)
+    if(Enable_HTTP_Command_Poll && HTTP_Command_Poll_Interval_Sec > 0)
     {
         if(g_lastHttpPollTime == 0 || (TimeCurrent() - g_lastHttpPollTime) >= HTTP_Command_Poll_Interval_Sec)
         {
@@ -380,10 +381,25 @@ void ExecuteTradeCommand(string jsonCommand)
 	int orderType = (side == "BUY") ? OP_BUY : OP_SELL;
 	double price = (orderType == OP_BUY) ? MarketInfo(symbol, MODE_ASK) : MarketInfo(symbol, MODE_BID);
 
+	// Normalize lot and price only; do not set SL/TP (managed by close signals)
+	int digits = (int)MarketInfo(symbol, MODE_DIGITS);
+	double minLot = MarketInfo(symbol, MODE_MINLOT);
+	double maxLot = MarketInfo(symbol, MODE_MAXLOT);
+	double lotStep = MarketInfo(symbol, MODE_LOTSTEP);
+	if(lotStep > 0) lots = MathFloor(lots / lotStep) * lotStep;
+	if(lots < minLot) lots = minLot;
+	if(lots > maxLot) lots = maxLot;
+	price = NormalizeDouble(price, digits);
+
+	// Force SL/TP to zero; EA will send close signals when criteria fail
+	sl = 0; tp = 0;
+
 	int ticket = OrderSend(symbol, orderType, lots, price, 10, sl, tp, "AutoTrade: " + strategy, 0, 0, clrGreen);
 	if(ticket > 0)
 	{
 		Print("✅ Trade executed: #", ticket, " ", symbol, " ", side, " ", DoubleToString(lots, 2), " lots @ ", DoubleToString(price, (int)MarketInfo(symbol, MODE_DIGITS)));
+		// Notify backend/Telegram with detailed info
+		SendOpenConfirmation(ticket, symbol, side, lots, price, strategy);
 	}
 	else
 	{
@@ -394,26 +410,76 @@ void ExecuteTradeCommand(string jsonCommand)
 void ExecuteCloseCommand(string jsonCommand)
 {
 	Print("📥 Close command received: ", jsonCommand);
+	string targetSymbol = ExtractJSONValue(jsonCommand, "symbol");
+	string rawStrategy = ExtractJSONValue(jsonCommand, "strategy");
+	string strategy = rawStrategy;
+	if(StringFind(strategy, "CLOSE_") == 0)
+		strategy = StringSubstr(strategy, 6); // remove CLOSE_
 	int ticket = (int)StringToDouble(ExtractJSONValue(jsonCommand, "ticket"));
-	if(ticket <= 0)
+
+	// 1) Try close by ticket if provided
+	if(ticket > 0)
 	{
-		Print("❌ Invalid ticket number");
-		return;
+		if(OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES))
+		{
+			double cp = (OrderType() == OP_BUY) ? MarketInfo(OrderSymbol(), MODE_BID) : MarketInfo(OrderSymbol(), MODE_ASK);
+			double lots = OrderLots();
+			if(OrderClose(OrderTicket(), lots, cp, 10, clrRed))
+			{
+				Print("✅ Order closed by ticket: #", OrderTicket());
+				SendCloseConfirmation(OrderTicket(), OrderSymbol(), OrderType() == OP_BUY ? "BUY" : "SELL", OrderLots(), OrderOpenPrice(), cp, OrderProfit());
+				return;
+			}
+			else
+			{
+				Print("❌ Close by ticket failed: #", OrderTicket(), " Error ", GetLastError());
+			}
+		}
 	}
-	if(!OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES))
+
+	// 2) Close by strategy (and symbol if provided)
+	int closedCount = 0;
+	for(int i = OrdersTotal() - 1; i >= 0; i--)
 	{
-		Print("❌ Order not found: #", ticket);
-		return;
+		if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+			continue;
+
+		// Relaxed symbol match to handle broker suffixes (e.g., XAUUSD.m)
+		bool symbolMatch = true;
+		if(targetSymbol != "")
+		{
+			string osym = OrderSymbol();
+			symbolMatch = (osym == targetSymbol) || (StringFind(osym, targetSymbol) >= 0) || (StringFind(targetSymbol, osym) >= 0);
+		}
+		if(!symbolMatch) continue;
+
+		// Ensure the order belongs to this EA (by comment)
+		string c = OrderComment();
+		if(StringFind(c, "AutoTrade") < 0)
+			continue;
+
+		// If strategy provided, enforce it; otherwise accept any AutoTrade order on symbol
+		if(strategy != "" && StringFind(c, strategy) < 0)
+			continue;
+
+		double closePrice = (OrderType() == OP_BUY) ? MarketInfo(OrderSymbol(), MODE_BID) : MarketInfo(OrderSymbol(), MODE_ASK);
+		double lots2 = OrderLots();
+		int t = OrderTicket();
+		if(OrderClose(t, lots2, closePrice, 10, clrRed))
+		{
+			closedCount++;
+			Print("✅ Order closed: #", t, " strategy=", strategy);
+			SendCloseConfirmation(t, OrderSymbol(), OrderType() == OP_BUY ? "BUY" : "SELL", OrderLots(), OrderOpenPrice(), closePrice, OrderProfit());
+		}
+		else
+		{
+			Print("❌ Close failed: Ticket #", t, " Error ", GetLastError());
+		}
 	}
-	double closePrice = (OrderType() == OP_BUY) ? MarketInfo(OrderSymbol(), MODE_BID) : MarketInfo(OrderSymbol(), MODE_ASK);
-	double lots = OrderLots();
-	if(OrderClose(ticket, lots, closePrice, 10, clrRed))
+
+	if(closedCount == 0)
 	{
-		Print("✅ Order closed: #", ticket);
-	}
-	else
-	{
-		Print("❌ Close failed: Error ", GetLastError());
+		Print("❌ No matching orders found to close for strategy=", strategy, " symbol=", targetSymbol);
 	}
 }
 
@@ -439,10 +505,8 @@ string ExtractJSONValue(string json, string key)
 // Poll backend /commands and execute returned commands
 void PollBackendCommands()
 {
-    // Build URL from base if empty; append token if not present
-    string url = Backend_Commands_URL;
-    if(StringLen(url) == 0)
-        url = Backend_Base_URL + "/commands";
+    // Build URL from base; append token if not present
+    string url = Backend_Base_URL + "/commands";
     if(StringFind(StringToLower(url), "token=") < 0)
     {
         string sep = (StringFind(url, "?") >= 0) ? "&" : "?";
@@ -511,4 +575,56 @@ void PollBackendCommands()
                 ExecuteTradeCommand(obj);
         }
     }
+}
+
+void SendOpenConfirmation(int ticket, string symbol, string side, double lots, double openPrice, string strategy)
+{
+	string json = "{";
+	json += "\"token\":\"" + Api_Auth_Token + "\",";
+	json += "\"symbol\":\"" + symbol + "\",";
+	json += "\"timeframe\":0,";
+	json += "\"side\":\"" + side + "\",";
+	json += "\"strategy\":\"ORDER_OPENED_CONFIRMATION\",";
+	json += "\"price\":" + DoubleToString(openPrice, (int)MarketInfo(symbol, MODE_DIGITS)) + ",";
+	json += "\"ref1\":" + DoubleToString(lots, 2) + ",";
+	json += "\"ref2\":" + DoubleToString(ticket, 0) + ",";
+	json += "\"reason\":\"" + strategy + "\",";
+	json += "\"timestamp\":" + IntegerToString((int)TimeCurrent());
+	json += "}";
+
+	char post[]; StringToCharArray(json, post);
+	char result[]; string result_headers = "";
+	ResetLastError();
+	string url = Backend_Base_URL + "/signal";
+	int res = WebRequest("POST", url, "", "", 10000, post, ArraySize(post), result, result_headers);
+	if(res == -1)
+	{
+		Print("❌ Open confirmation WebRequest failed: ", GetLastError());
+	}
+}
+
+void SendCloseConfirmation(int ticket, string symbol, string side, double lots, double openPrice, double closePrice, double profit)
+{
+	string json = "{";
+	json += "\"token\":\"" + Api_Auth_Token + "\",";
+	json += "\"symbol\":\"" + symbol + "\",";
+	json += "\"timeframe\":0,";
+	json += "\"side\":\"" + side + "\",";
+	json += "\"strategy\":\"ORDER_CLOSED_CONFIRMATION\",";
+	json += "\"price\":" + DoubleToString(closePrice, (int)MarketInfo(symbol, MODE_DIGITS)) + ",";
+	json += "\"ref1\":" + DoubleToString(openPrice, (int)MarketInfo(symbol, MODE_DIGITS)) + ",";
+	json += "\"ref2\":" + DoubleToString(ticket, 0) + ",";
+	json += "\"reason\":\"" + DoubleToString(lots, 2) + ";" + DoubleToString(profit, 2) + ";" + AccountCurrency() + "\",";
+	json += "\"timestamp\":" + IntegerToString((int)TimeCurrent());
+	json += "}";
+
+	char post[]; StringToCharArray(json, post);
+	char result[]; string result_headers = "";
+	ResetLastError();
+	string url = Backend_Base_URL + "/signal";
+	int res = WebRequest("POST", url, "", "", 10000, post, ArraySize(post), result, result_headers);
+	if(res == -1)
+	{
+		Print("❌ Close confirmation WebRequest failed: ", GetLastError());
+	}
 }
