@@ -36,7 +36,7 @@ input string Api_Auth_Token = "changeme";                   // Opsi auth sederha
 input group "=== Health Check Settings ==="
 input bool   Enable_Health_Ping = true;                      // Aktifkan ping kesehatan backend
 input string Backend_Health_URL = "http://localhost:8080/health"; // URL health backend
-input int    Health_Ping_Interval_Sec = 60;                  // Interval ping (detik)
+input int    Health_Ping_Interval_Sec = 30;                  // Interval ping (detik)
 
 input group "=== Symbol/Run Settings ==="
 input bool Only_Current_Symbol = true;
@@ -114,14 +114,13 @@ void OnTimer()
     if(Health_Ping_Interval_Sec <= 0) return;
     if(StringLen(Backend_Health_URL) == 0) return;
 
-    // Prepare empty body (backend health accepts any method)
-    char post[];
-    ArrayResize(post, 0);
+    // Prepare empty body
+    char post[]; ArrayResize(post, 0);
     char result[];
-    string headers;
+    string result_headers = "";
 
     ResetLastError();
-    int res = WebRequest("application/json", Backend_Health_URL, post, ArraySize(post), result, headers);
+    int res = WebRequest("GET", Backend_Health_URL, "", "", 5000, post, ArraySize(post), result, result_headers);
     if(res == -1)
     {
         int err = GetLastError();
@@ -284,12 +283,12 @@ void SendSignal(string side, string strategy, string symbol, int tf, double pric
 
     char post[]; StringToCharArray(json, post);
     char result[];
-    string headers;
-    int    status = 0;
+    string result_headers = "";
+    // Add content-type via standard header rules handled internally by terminal
     ResetLastError();
 
     // Ensure Backend_URL is whitelisted in Tools > Options > Expert Advisors > WebRequest
-    int res = WebRequest("application/json", Backend_URL, post, ArraySize(post), result, headers);
+    int res = WebRequest("POST", Backend_URL, "", "", 10000, post, ArraySize(post), result, result_headers);
     if(res == -1)
     {
         int err = GetLastError();
