@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"sync"
+
 	"github.com/joho/godotenv"
 )
 
@@ -126,6 +128,8 @@ type TradeCommand struct {
 
 // ============ GLOBALS ============
 var config *Config
+var queueMu sync.Mutex
+var commandQueue []TradeCommand
 
 // ============ TELEGRAM FUNCTIONS ============
 func sendTelegramWithButtons(text string, buttons *TelegramInlineKeyboard) error {
@@ -179,6 +183,13 @@ func sendTradeToMT4(trade TradeCommand) error {
 	return nil
 }
 
+func enqueueTrade(trade TradeCommand) {
+	queueMu.Lock()
+	defer queueMu.Unlock()
+	commandQueue = append(commandQueue, trade)
+	log.Printf("📥 Enqueued trade for HTTP bridge: %s %s %.2f lots", trade.Symbol, trade.Side, trade.Lots)
+}
+
 func sendCloseToMT4(ticket int, symbol string) error {
 	closeCommand := TradeCommand{
 		Action: "close",
@@ -195,6 +206,13 @@ func sendCloseToMT4(ticket int, symbol string) error {
 
 	log.Printf("🔴 Close command sent: ticket #%d", ticket)
 	return nil
+}
+
+func enqueueClose(ticket int, symbol string) {
+	queueMu.Lock()
+	defer queueMu.Unlock()
+	commandQueue = append(commandQueue, TradeCommand{Action: "close", Ticket: ticket, Symbol: symbol})
+	log.Printf("📥 Enqueued close for HTTP bridge: ticket #%d", ticket)
 }
 
 // ============ MT4 BRIDGE FUNCTIONS ============
@@ -449,6 +467,7 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 				sendTelegram(fmt.Sprintf("✅ Trade: %s %s %.1f lots @ %.2f", symbol, side, lots, price))
 				log.Printf("✅ Trade command dispatched to MT4")
 			}
+			enqueueTrade(trade)
 		}
 
 	case "lot":
@@ -481,6 +500,7 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 				answerCallbackQuery(callback.ID, fmt.Sprintf("✅ %.1f lot sent!", lots))
 				log.Printf("✅ Trade command dispatched to MT4")
 			}
+			enqueueTrade(trade)
 		}
 
 	case "close":
@@ -498,6 +518,7 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 				sendTelegram(fmt.Sprintf("🔴 Close order #%.0f", ticket))
 				log.Printf("✅ Close command dispatched to MT4")
 			}
+			enqueueClose(int(ticket), symbol)
 		}
 
 	case "ignore":
@@ -521,6 +542,38 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
+}
+
+// ============ HTTP BRIDGE: COMMANDS QUEUE ==========
+func commandsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		token = r.Header.Get("X-API-Token")
+	}
+	if token != config.APIAuthToken {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte("unauthorized"))
+		return
+	}
+
+	queueMu.Lock()
+	cmds := make([]TradeCommand, len(commandQueue))
+	copy(cmds, commandQueue)
+	commandQueue = commandQueue[:0]
+	queueMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":       true,
+		"count":    len(cmds),
+		"commands": cmds,
+		"ts":       time.Now().Unix(),
+	})
 }
 
 // ============ STARTUP ============
@@ -584,9 +637,10 @@ func main() {
 
 	// Setup HTTP routes
 	mux := http.NewServeMux()
-	mux.HandleFunc("/signal", signalHandler)   // Receive signals from MT4
-	mux.HandleFunc("/webhook", webhookHandler) // Telegram webhook
-	mux.HandleFunc("/health", healthHandler)   // Health check
+	mux.HandleFunc("/signal", signalHandler)     // Receive signals from MT4
+	mux.HandleFunc("/webhook", webhookHandler)   // Telegram webhook
+	mux.HandleFunc("/health", healthHandler)     // Health check
+	mux.HandleFunc("/commands", commandsHandler) // HTTP bridge for remote EA
 
 	// Start server
 	log.Printf("🌐 Server starting on %s", config.Port)

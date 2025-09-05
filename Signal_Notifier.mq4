@@ -26,17 +26,20 @@ input int Breakout_Buffer_Points = 200;        // Buffer di atas/bawah range (po
 
 input group "=== Filters ==="
 input bool Filter_Spread = true;
-input double Max_Spread_Points = 350;          // Batas spread (points)
+input double Max_Spread_Points = 500;          // Batas spread (points)
 input bool Filter_News = false;                // Placeholder (integrasi optional)
 
 input group "=== Webhook/Backend Settings ==="
-input string Backend_URL = "http://localhost:8080/signal"; // URL Go backend
-input string Api_Auth_Token = "changeme";                   // Opsi auth sederhana
+input string Backend_Base_URL = "http://localhost:8080";    // Base URL backend
+input string Api_Auth_Token = "changeme";                   // auth token
 
 input group "=== Health Check Settings ==="
-input bool   Enable_Health_Ping = true;                      // Aktifkan ping kesehatan backend
-input string Backend_Health_URL = "http://localhost:8080/health"; // URL health backend
+input bool   Enable_Health_Ping = false;                      // Aktifkan ping kesehatan backend
 input int    Health_Ping_Interval_Sec = 30;                  // Interval ping (detik)
+
+input group "=== HTTP Command Bridge ==="
+input bool   Enable_HTTP_Command_Poll = false;               // Poll perintah via HTTP (untuk server terpisah)
+input int    HTTP_Command_Poll_Interval_Sec = 5;             // Interval polling perintah (detik)
 
 input group "=== Symbol/Run Settings ==="
 input bool Only_Current_Symbol = true;
@@ -45,20 +48,21 @@ input bool Send_Once_Per_Candle = true;       // Hindari spam setiap tick
 
 //=== Globals ===
 datetime g_lastBarTime = 0;
+datetime g_lastHttpPollTime = 0;
 
 //+------------------------------------------------------------------+
 //| OnInit                                                           |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-    Print("Signal Notifier EA started. Add backend URL to MT4 WebRequest whitelist: Tools > Options > Expert Advisors > Allow WebRequest for listed URL: ", Backend_URL);
+    Print("Signal Notifier EA started. Add backend base URL to MT4 WebRequest whitelist: ", Backend_Base_URL);
 
     // Setup health ping timer if enabled
-    if(Enable_Health_Ping && Health_Ping_Interval_Sec > 0 && StringLen(Backend_Health_URL) > 0)
+    if(Enable_Health_Ping && Health_Ping_Interval_Sec > 0)
     {
         // EventSetTimer uses seconds
         EventSetTimer(Health_Ping_Interval_Sec);
-        Print("Health ping enabled every ", Health_Ping_Interval_Sec, "s to ", Backend_Health_URL);
+        Print("Health ping enabled every ", Health_Ping_Interval_Sec, "s to ", Backend_Base_URL, "/health");
     }
     return(INIT_SUCCEEDED);
 }
@@ -103,6 +107,9 @@ void OnTick()
     // Asia Breakout
     if(Enable_Asia_Breakout)
         CheckAsiaBreakoutSignal(tradeSymbol, tf);
+
+    // Execute incoming trade/close commands from backend
+    CheckTradeCommands();
 }
 
 //+------------------------------------------------------------------+
@@ -112,7 +119,6 @@ void OnTimer()
 {
     if(!Enable_Health_Ping) return;
     if(Health_Ping_Interval_Sec <= 0) return;
-    if(StringLen(Backend_Health_URL) == 0) return;
 
     // Prepare empty body
     char post[]; ArrayResize(post, 0);
@@ -120,17 +126,29 @@ void OnTimer()
     string result_headers = "";
 
     ResetLastError();
-    int res = WebRequest("GET", Backend_Health_URL, "", "", 5000, post, ArraySize(post), result, result_headers);
+    // Health URL derived from base URL
+    string healthUrl = Backend_Base_URL + "/health";
+    int res = WebRequest("GET", healthUrl, "", "", 5000, post, ArraySize(post), result, result_headers);
     if(res == -1)
     {
         int err = GetLastError();
-        Print("Health ping failed ", err, ". Ensure URL is allowed in MT4 settings: ", Backend_Health_URL);
+        Print("Health ping failed ", err, ". Ensure URL is allowed in MT4 settings: ", healthUrl);
         return;
     }
 
     string resp = CharArrayToString(result, 0, -1);
     // Keep logs concise; only print brief success message
     Print("Health OK resp=", resp);
+
+    // Poll HTTP commands if enabled and interval elapsed
+    if(Enable_HTTP_Command_Poll && HTTP_Command_Poll_Interval_Sec > 0 && StringLen(Backend_Commands_URL) > 0)
+    {
+        if(g_lastHttpPollTime == 0 || (TimeCurrent() - g_lastHttpPollTime) >= HTTP_Command_Poll_Interval_Sec)
+        {
+            PollBackendCommands();
+            g_lastHttpPollTime = TimeCurrent();
+        }
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -287,12 +305,13 @@ void SendSignal(string side, string strategy, string symbol, int tf, double pric
     // Add content-type via standard header rules handled internally by terminal
     ResetLastError();
 
-    // Ensure Backend_URL is whitelisted in Tools > Options > Expert Advisors > WebRequest
-    int res = WebRequest("POST", Backend_URL, "", "", 10000, post, ArraySize(post), result, result_headers);
+    // POST to baseURL/signal
+    string signalUrl = Backend_Base_URL + "/signal";
+    int res = WebRequest("POST", signalUrl, "", "", 10000, post, ArraySize(post), result, result_headers);
     if(res == -1)
     {
         int err = GetLastError();
-        Print("WebRequest failed ", err, ". Ensure URL is allowed in MT4 settings: ", Backend_URL);
+        Print("WebRequest failed ", err, ". Ensure URL is allowed in MT4 settings: ", signalUrl);
         return;
     }
 
@@ -301,3 +320,195 @@ void SendSignal(string side, string strategy, string symbol, int tf, double pric
 }
 
 //+------------------------------------------------------------------+
+
+// Read trade/close commands from Files/Common and execute
+void CheckTradeCommands()
+{
+	// Trade command
+	string tradeFile = "trade_command.json";
+	int handle = FileOpen(tradeFile, FILE_READ|FILE_TXT|FILE_COMMON);
+	if(handle == INVALID_HANDLE)
+		handle = FileOpen(tradeFile, FILE_READ|FILE_TXT);
+	if(handle != INVALID_HANDLE)
+	{
+		string command = "";
+		while(!FileIsEnding(handle)) command += FileReadString(handle);
+		FileClose(handle);
+		// Attempt delete from both locations
+		FileDelete(tradeFile);
+		int h2 = FileOpen(tradeFile, FILE_WRITE|FILE_COMMON); if(h2 != INVALID_HANDLE){ FileClose(h2); FileDelete(tradeFile); }
+
+		if(StringLen(command) > 0)
+			ExecuteTradeCommand(command);
+	}
+
+	// Close command
+	string closeFile = "close_command.json";
+	handle = FileOpen(closeFile, FILE_READ|FILE_TXT|FILE_COMMON);
+	if(handle == INVALID_HANDLE)
+		handle = FileOpen(closeFile, FILE_READ|FILE_TXT);
+	if(handle != INVALID_HANDLE)
+	{
+		string cmd = "";
+		while(!FileIsEnding(handle)) cmd += FileReadString(handle);
+		FileClose(handle);
+		FileDelete(closeFile);
+		int h3 = FileOpen(closeFile, FILE_WRITE|FILE_COMMON); if(h3 != INVALID_HANDLE){ FileClose(h3); FileDelete(closeFile); }
+
+		if(StringLen(cmd) > 0)
+			ExecuteCloseCommand(cmd);
+	}
+}
+
+void ExecuteTradeCommand(string jsonCommand)
+{
+	Print("📥 Trade command received: ", jsonCommand);
+
+	string symbol = ExtractJSONValue(jsonCommand, "symbol");
+	string side = ExtractJSONValue(jsonCommand, "side");
+	double lots = StringToDouble(ExtractJSONValue(jsonCommand, "lots"));
+	double sl = StringToDouble(ExtractJSONValue(jsonCommand, "sl"));
+	double tp = StringToDouble(ExtractJSONValue(jsonCommand, "tp"));
+	string strategy = ExtractJSONValue(jsonCommand, "strategy");
+
+	if(symbol == "" || (side != "BUY" && side != "SELL") || lots <= 0)
+	{
+		Print("❌ Invalid trade parameters");
+		return;
+	}
+
+	int orderType = (side == "BUY") ? OP_BUY : OP_SELL;
+	double price = (orderType == OP_BUY) ? MarketInfo(symbol, MODE_ASK) : MarketInfo(symbol, MODE_BID);
+
+	int ticket = OrderSend(symbol, orderType, lots, price, 10, sl, tp, "AutoTrade: " + strategy, 0, 0, clrGreen);
+	if(ticket > 0)
+	{
+		Print("✅ Trade executed: #", ticket, " ", symbol, " ", side, " ", DoubleToString(lots, 2), " lots @ ", DoubleToString(price, (int)MarketInfo(symbol, MODE_DIGITS)));
+	}
+	else
+	{
+		Print("❌ Trade failed: Error ", GetLastError());
+	}
+}
+
+void ExecuteCloseCommand(string jsonCommand)
+{
+	Print("📥 Close command received: ", jsonCommand);
+	int ticket = (int)StringToDouble(ExtractJSONValue(jsonCommand, "ticket"));
+	if(ticket <= 0)
+	{
+		Print("❌ Invalid ticket number");
+		return;
+	}
+	if(!OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES))
+	{
+		Print("❌ Order not found: #", ticket);
+		return;
+	}
+	double closePrice = (OrderType() == OP_BUY) ? MarketInfo(OrderSymbol(), MODE_BID) : MarketInfo(OrderSymbol(), MODE_ASK);
+	double lots = OrderLots();
+	if(OrderClose(ticket, lots, closePrice, 10, clrRed))
+	{
+		Print("✅ Order closed: #", ticket);
+	}
+	else
+	{
+		Print("❌ Close failed: Error ", GetLastError());
+	}
+}
+
+string ExtractJSONValue(string json, string key)
+{
+	string searchKey = "\"" + key + "\":";
+	int startPos = StringFind(json, searchKey);
+	if(startPos == -1) return "";
+	startPos += StringLen(searchKey);
+	while(startPos < StringLen(json) && (StringGetCharacter(json, startPos) == ' ' || StringGetCharacter(json, startPos) == '"')) startPos++;
+	int endPos = startPos;
+	bool inQuotes = (StringGetCharacter(json, startPos-1) == '"');
+	while(endPos < StringLen(json))
+	{
+		int ch = StringGetCharacter(json, endPos);
+		if(inQuotes && ch == '"') break;
+		if(!inQuotes && (ch == ',' || ch == '}')) break;
+		endPos++;
+	}
+	return StringSubstr(json, startPos, endPos - startPos);
+}
+
+// Poll backend /commands and execute returned commands
+void PollBackendCommands()
+{
+    // Build URL from base if empty; append token if not present
+    string url = Backend_Commands_URL;
+    if(StringLen(url) == 0)
+        url = Backend_Base_URL + "/commands";
+    if(StringFind(StringToLower(url), "token=") < 0)
+    {
+        string sep = (StringFind(url, "?") >= 0) ? "&" : "?";
+        url = url + sep + "token=" + Api_Auth_Token;
+    }
+
+    char post[]; ArrayResize(post, 0);
+    char result[]; string result_headers = "";
+    ResetLastError();
+    int res = WebRequest("GET", url, "", "", 5000, post, ArraySize(post), result, result_headers);
+    if(res == -1)
+    {
+        Print("Commands poll failed ", GetLastError(), " URL=", url);
+        return;
+    }
+
+    string body = CharArrayToString(result, 0, -1);
+    // Find commands array
+    int idx = StringFind(body, "\"commands\"");
+    if(idx < 0) return;
+    int arrStart = StringFind(body, "[", idx);
+    if(arrStart < 0) return;
+    int depth = 0;
+    int i = arrStart;
+    int arrEnd = -1;
+    while(i < StringLen(body))
+    {
+        int ch = StringGetCharacter(body, i);
+        if(ch == '[') depth++;
+        if(ch == ']') { depth--; if(depth == 0) { arrEnd = i; break; } }
+        i++;
+    }
+    if(arrEnd < 0) return;
+    string arr = StringSubstr(body, arrStart+1, arrEnd - arrStart - 1);
+
+    // Iterate JSON objects by matching braces
+    int pos = 0;
+    while(pos < StringLen(arr))
+    {
+        // Skip commas/whitespace
+        while(pos < StringLen(arr))
+        {
+            int c = StringGetCharacter(arr, pos);
+            if(c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == ',') { pos++; continue; }
+            break;
+        }
+        if(pos >= StringLen(arr)) break;
+        if(StringGetCharacter(arr, pos) != '{') { pos++; continue; }
+        int objStart = pos;
+        int brace = 0;
+        while(pos < StringLen(arr))
+        {
+            int c2 = StringGetCharacter(arr, pos);
+            if(c2 == '{') brace++;
+            if(c2 == '}') { brace--; if(brace == 0) { pos++; break; } }
+            pos++;
+        }
+        int objEnd = pos;
+        if(objEnd > objStart)
+        {
+            string obj = StringSubstr(arr, objStart, objEnd - objStart);
+            string action = ExtractJSONValue(obj, "action");
+            if(StringFind(action, "close") >= 0 || StringFind(action, "CLOSE") >= 0)
+                ExecuteCloseCommand(obj);
+            else
+                ExecuteTradeCommand(obj);
+        }
+    }
+}

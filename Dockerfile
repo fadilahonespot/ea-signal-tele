@@ -33,11 +33,14 @@ WORKDIR /app
 COPY --from=builder /app/bin/server /app/server
 
 # Create default data directory (override with MT4_DATA_PATH env)
-RUN mkdir -p /app/mt4-files && chown -R app:app /app
+RUN mkdir -p /data/mt4-files /app/mt4-files && chown -R app:app /data /app
 
 # Environment (override as needed at runtime)
 ENV PORT=":8080" \
-    MT4_DATA_PATH="/app/mt4-files"
+    MT4_DATA_PATH="/data/mt4-files"
+
+# Declare volume for host-mapped MT4 Common Files directory
+VOLUME ["/data/mt4-files"]
 
 # Expose HTTP port (container listens on :8080 by default)
 EXPOSE 8080
