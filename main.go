@@ -166,6 +166,27 @@ func answerCallbackQuery(callbackQueryID, text string) error {
 	return nil
 }
 
+func removeInlineKeyboard(chatID int64, messageID int) error {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/editMessageReplyMarkup", config.TelegramBotToken)
+	payload := map[string]interface{}{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"reply_markup": map[string]interface{}{
+			"inline_keyboard": [][]interface{}{},
+		},
+	}
+	b, _ := json.Marshal(payload)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("editMessageReplyMarkup failed: %s", resp.Status)
+	}
+	return nil
+}
+
 // ============ MT4 COMMUNICATION ============
 func sendTradeToMT4(trade TradeCommand) error {
 	commandFile := filepath.Join(config.MT4DataPath, "trade_command.json")
@@ -315,13 +336,16 @@ func signalHandler(w http.ResponseWriter, r *http.Request) {
 		buttons = &TelegramInlineKeyboard{
 			InlineKeyboard: [][]TelegramInlineButton{
 				{
-					{Text: "🟢 OPEN AGAIN", CallbackData: "trade|" + signalData},
 					{Text: "❌ DONE", CallbackData: "ignore|" + signalData},
 				},
 				{
 					{Text: "📊 0.1 LOT", CallbackData: "lot|0.1|" + signalData},
 					{Text: "📊 0.2 LOT", CallbackData: "lot|0.2|" + signalData},
 					{Text: "📊 0.5 LOT", CallbackData: "lot|0.5|" + signalData},
+				},
+				{
+					{Text: "📊 0.7 LOT", CallbackData: "lot|0.7|" + signalData},
+					{Text: "📊 1.0 LOT", CallbackData: "lot|1.0|" + signalData},
 				},
 			},
 		}
@@ -369,10 +393,14 @@ func signalHandler(w http.ResponseWriter, r *http.Request) {
 				},
 			},
 		}
+	} else if p.Strategy == "ORDERS_STATUS" {
+		// EA pushed active orders status in Reason
+		msg = fmt.Sprintf("📋 Active Orders\n%s", p.Reason)
+		buttons = nil
 	} else {
 		// OPEN SIGNAL
 		msg = fmt.Sprintf(
-			"🚨 [OPEN SIGNAL]\n📊 %s\n📈 %s\n🎯 %s\n💰 Price: %.2f\n🕐 %s",
+			"🚨 [OPEN SIGNAL]\n📊 %s\n📈 %s\n🎯 %s\n💰 Price: %.2f\n📝 Pilih ukuran lot di bawah untuk eksekusi.\n🕐 %s",
 			p.Symbol, p.Side, p.Strategy, p.Price, ts,
 		)
 
@@ -380,13 +408,19 @@ func signalHandler(w http.ResponseWriter, r *http.Request) {
 		buttons = &TelegramInlineKeyboard{
 			InlineKeyboard: [][]TelegramInlineButton{
 				{
-					{Text: "🟢 TRADE " + p.Side, CallbackData: "trade|" + signalData},
 					{Text: "❌ IGNORE", CallbackData: "ignore|" + signalData},
 				},
 				{
 					{Text: "📊 0.1 LOT", CallbackData: "lot|0.1|" + signalData},
 					{Text: "📊 0.2 LOT", CallbackData: "lot|0.2|" + signalData},
 					{Text: "📊 0.5 LOT", CallbackData: "lot|0.5|" + signalData},
+				},
+				{
+					{Text: "📊 0.7 LOT", CallbackData: "lot|0.7|" + signalData},
+					{Text: "📊 1.0 LOT", CallbackData: "lot|1.0|" + signalData},
+				},
+				{
+					{Text: "📋 ACTIVE ORDERS", CallbackData: "status"},
 				},
 			},
 		}
@@ -423,7 +457,16 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("🧲 CallbackQuery: id=%s chat=%d msgId=%d data=%q", update.CallbackQuery.ID, update.CallbackQuery.Message.Chat.ID, update.CallbackQuery.Message.MessageID, update.CallbackQuery.Data)
 		handleCallbackQuery(update.CallbackQuery)
 	} else if update.Message != nil {
-		log.Printf("💬 Non-callback message received")
+		// Handle text commands (no-buttons)
+		text := strings.TrimSpace(update.Message.Text)
+		if strings.HasPrefix(text, "/orders") || strings.HasPrefix(text, "/status") {
+			queueMu.Lock()
+			commandQueue = append(commandQueue, TradeCommand{Action: "status"})
+			queueMu.Unlock()
+			_ = sendTelegram("📋 Fetching active orders...")
+		} else {
+			log.Printf("💬 Non-callback message received: %q", text)
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -431,7 +474,7 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 
 func handleCallbackQuery(callback *TelegramCallbackQuery) {
 	parts := strings.Split(callback.Data, "|")
-	if len(parts) < 2 {
+	if len(parts) < 1 {
 		log.Printf("⚠️  Invalid callback data: %q", callback.Data)
 		return
 	}
@@ -471,6 +514,8 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 				answerCallbackQuery(callback.ID, "✅ Trade sent!")
 				sendTelegram(fmt.Sprintf("✅ Trade: %s %s %.1f lots @ %.2f", symbol, side, lots, price))
 				log.Printf("✅ Trade command dispatched to MT4")
+				// Remove inline buttons from the original message (best-effort)
+				_ = removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID)
 			}
 			enqueueTrade(trade)
 		}
@@ -504,6 +549,7 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 			} else {
 				answerCallbackQuery(callback.ID, fmt.Sprintf("✅ %.1f lot sent!", lots))
 				log.Printf("✅ Trade command dispatched to MT4")
+				_ = removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID)
 			}
 			enqueueTrade(trade)
 		}
@@ -526,10 +572,18 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 				answerCallbackQuery(callback.ID, "✅ Close sent!")
 				sendTelegram(fmt.Sprintf("🔴 Close order #%.0f", ticket))
 				log.Printf("✅ Close command dispatched to MT4")
+				_ = removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID)
 			}
 			enqueueClose(int(ticket), symbol, actualStrategy)
 		}
 
+	case "status":
+		// Enqueue a status command for EA to publish active orders
+		queueMu.Lock()
+		commandQueue = append(commandQueue, TradeCommand{Action: "status"})
+		queueMu.Unlock()
+		answerCallbackQuery(callback.ID, "📋 Fetching active orders...")
+		_ = removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID)
 	case "ignore":
 		answerCallbackQuery(callback.ID, "Signal ignored")
 		log.Printf("🚫 Signal ignored by user")
