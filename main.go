@@ -169,11 +169,9 @@ func answerCallbackQuery(callbackQueryID, text string) error {
 func removeInlineKeyboard(chatID int64, messageID int) error {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/editMessageReplyMarkup", config.TelegramBotToken)
 	payload := map[string]interface{}{
-		"chat_id":    chatID,
-		"message_id": messageID,
-		"reply_markup": map[string]interface{}{
-			"inline_keyboard": [][]interface{}{},
-		},
+		"chat_id":      chatID,
+		"message_id":   messageID,
+		"reply_markup": map[string]interface{}{}, // empty object removes keyboard
 	}
 	b, _ := json.Marshal(payload)
 	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
@@ -515,7 +513,9 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 				sendTelegram(fmt.Sprintf("✅ Trade: %s %s %.1f lots @ %.2f", symbol, side, lots, price))
 				log.Printf("✅ Trade command dispatched to MT4")
 				// Remove inline buttons from the original message (best-effort)
-				_ = removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID)
+				if err := removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID); err != nil {
+					log.Printf("⚠️ removeInlineKeyboard error: %v", err)
+				}
 			}
 			enqueueTrade(trade)
 		}
@@ -549,7 +549,9 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 			} else {
 				answerCallbackQuery(callback.ID, fmt.Sprintf("✅ %.1f lot sent!", lots))
 				log.Printf("✅ Trade command dispatched to MT4")
-				_ = removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID)
+				if err := removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID); err != nil {
+					log.Printf("⚠️ removeInlineKeyboard error: %v", err)
+				}
 			}
 			enqueueTrade(trade)
 		}
@@ -572,7 +574,9 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 				answerCallbackQuery(callback.ID, "✅ Close sent!")
 				sendTelegram(fmt.Sprintf("🔴 Close order #%.0f", ticket))
 				log.Printf("✅ Close command dispatched to MT4")
-				_ = removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID)
+				if err := removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID); err != nil {
+					log.Printf("⚠️ removeInlineKeyboard error: %v", err)
+				}
 			}
 			enqueueClose(int(ticket), symbol, actualStrategy)
 		}
@@ -583,16 +587,22 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 		commandQueue = append(commandQueue, TradeCommand{Action: "status"})
 		queueMu.Unlock()
 		answerCallbackQuery(callback.ID, "📋 Fetching active orders...")
-		_ = removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID)
+		if err := removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID); err != nil {
+			log.Printf("⚠️ removeInlineKeyboard error: %v", err)
+		}
 	case "ignore":
 		answerCallbackQuery(callback.ID, "Signal ignored")
 		log.Printf("🚫 Signal ignored by user")
-		_ = removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID)
+		if err := removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID); err != nil {
+			log.Printf("⚠️ removeInlineKeyboard error: %v", err)
+		}
 
 	case "keep":
 		answerCallbackQuery(callback.ID, "Order will remain open")
 		log.Printf("⏳ Keep order open selected by user")
-		_ = removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID)
+		if err := removeInlineKeyboard(callback.Message.Chat.ID, callback.Message.MessageID); err != nil {
+			log.Printf("⚠️ removeInlineKeyboard error: %v", err)
+		}
 	}
 }
 

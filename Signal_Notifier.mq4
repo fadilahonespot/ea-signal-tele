@@ -46,6 +46,82 @@ input bool Only_Current_Symbol = true;
 input int Magic_Number = 0;                   // not used here, reserved
 input bool Send_Once_Per_Candle = true;       // Hindari spam setiap tick
 
+// === Additional Strategy Inputs ===
+input group "=== RSI Pullback Settings ==="
+input bool   Enable_RSI_Pullback = false;
+input int    RSI_Period = 14;
+input int    RSI_BuyZone_Low = 40;   // 40-50 zone for BUY pullback
+input int    RSI_BuyZone_High = 50;
+input int    RSI_SellZone_Low = 50;  // 50-60 zone for SELL pullback
+input int    RSI_SellZone_High = 60;
+
+input group "=== Breakout Retest Settings ==="
+input bool   Enable_Asia_Retest = false;
+input int    Retest_Tolerance_Points = 150; // tolerance to retest level
+input int    ATR_Period = 14;
+input double ATR_Min_Points = 350;          // minimal ATR (points) for volatility
+
+// === VWAP & Volatility Inputs ===
+input group "=== VWAP Settings ==="
+input bool   Enable_VWAP = false;
+input string VWAP_Session_Start_UTC = "00:00";
+input int    VWAP_ATR_Period = 14;
+input double VWAP_Dev_Mult_Reversion = 1.0; // reversion band = vwap ± mult*ATR
+input double VWAP_Dev_Mult_Continuation = 2.0; // continuation band hold
+
+input group "=== Bollinger Squeeze Settings ==="
+input bool   Enable_BB_Squeeze = false;
+input int    BB_Period = 20;
+input double BB_Dev = 2.0;
+input int    BB_Squeeze_Threshold_Points = 150; // width threshold
+
+input group "=== Keltner vs Bollinger Settings ==="
+input bool   Enable_KC_BB_Expansion = false;
+input int    KC_Period = 20;
+input double KC_ATR_Mult = 1.5;
+input int    KC_ATR_Period = 14;
+
+// === Candlestick helpers ===
+bool IsBullEngulfing(string symbol, int tf, int shift)
+{
+	double open1 = iOpen(symbol, tf, shift+1);
+	double close1 = iClose(symbol, tf, shift+1);
+	double open0 = iOpen(symbol, tf, shift);
+	double close0 = iClose(symbol, tf, shift);
+	return (close1 < open1) && (close0 > open0) && (close0 >= open1) && (open0 <= close1);
+}
+
+bool IsBearEngulfing(string symbol, int tf, int shift)
+{
+	double open1 = iOpen(symbol, tf, shift+1);
+	double close1 = iClose(symbol, tf, shift+1);
+	double open0 = iOpen(symbol, tf, shift);
+	double close0 = iClose(symbol, tf, shift);
+	return (close1 > open1) && (close0 < open0) && (close0 <= open1) && (open0 >= close1);
+}
+
+bool IsPinBarBull(string symbol, int tf, int shift)
+{
+	double high = iHigh(symbol, tf, shift);
+	double low  = iLow(symbol, tf, shift);
+	double open = iOpen(symbol, tf, shift);
+	double close= iClose(symbol, tf, shift);
+	double body = MathAbs(close - open);
+	double tail = MathAbs(open - low);
+	return (close > open) && (tail > body * 2.0) && ((high - close) < body);
+}
+
+bool IsPinBarBear(string symbol, int tf, int shift)
+{
+	double high = iHigh(symbol, tf, shift);
+	double low  = iLow(symbol, tf, shift);
+	double open = iOpen(symbol, tf, shift);
+	double close= iClose(symbol, tf, shift);
+	double body = MathAbs(close - open);
+	double wick = MathAbs(high - open);
+	return (close < open) && (wick > body * 2.0) && ((close - low) < body);
+}
+
 //=== Globals ===
 datetime g_lastBarTime = 0;
 datetime g_lastHttpPollTime = 0;
@@ -111,6 +187,29 @@ void OnTick()
     // Asia Breakout
     if(Enable_Asia_Breakout)
         CheckAsiaBreakoutSignal(tradeSymbol, tf);
+
+    // RSI Pullback
+    if(Enable_RSI_Pullback)
+        CheckRSIPullbackSignal(tradeSymbol, tf);
+
+    // Asia Breakout Retest
+    if(Enable_Asia_Retest)
+        CheckAsiaBreakoutRetestSignal(tradeSymbol, tf);
+
+    // VWAP
+    if(Enable_VWAP)
+        CheckVWAPSignal(tradeSymbol, tf);
+
+    // Bollinger Squeeze
+    if(Enable_BB_Squeeze)
+        CheckBBSqueezeSignal(tradeSymbol, tf);
+
+    // Keltner vs Bollinger Expansion
+    if(Enable_KC_BB_Expansion)
+        CheckKeltnerExpansionSignal(tradeSymbol, tf);
+
+    // Monitor open orders for exit conditions
+    MonitorOpenOrdersForExit(tradeSymbol, tf);
 
     // Execute incoming trade/close commands from backend
     CheckTradeCommands();
@@ -204,13 +303,17 @@ void CheckEMAPullbackSignal(string symbol, int tf)
     bool bullCandle = close0 > open0;
     bool bearCandle = close0 < open0;
 
+    // Example wraps within strategies (pattern applied across all)
+    // EMA Pullback
     if(uptrend && nearPullback && bullCandle)
     {
-        SendSignal("BUY", "EMA_PULLBACK", symbol, tf, close0, emaFast0, emaSlow0);
+        if(!HasOpenOrderForStrategy(symbol, "EMA_PULLBACK"))
+            SendSignal("BUY", "EMA_PULLBACK", symbol, tf, close0, emaFast0, emaSlow0);
     }
     else if(downtrend && nearPullback && bearCandle)
     {
-        SendSignal("SELL", "EMA_PULLBACK", symbol, tf, close0, emaFast0, emaSlow0);
+        if(!HasOpenOrderForStrategy(symbol, "EMA_PULLBACK"))
+            SendSignal("SELL", "EMA_PULLBACK", symbol, tf, close0, emaFast0, emaSlow0);
     }
 }
 
@@ -259,12 +362,201 @@ void CheckAsiaBreakoutSignal(string symbol, int tf)
 
     if(close0 > upper)
     {
-        SendSignal("BUY", "ASIA_BREAKOUT", symbol, tf, close0, highRange, lowRange);
+        if(!HasOpenOrderForStrategy(symbol, "ASIA_BREAKOUT"))
+            SendSignal("BUY", "ASIA_BREAKOUT", symbol, tf, close0, highRange, lowRange);
     }
     else if(close0 < lower)
     {
-        SendSignal("SELL", "ASIA_BREAKOUT", symbol, tf, close0, highRange, lowRange);
+        if(!HasOpenOrderForStrategy(symbol, "ASIA_BREAKOUT"))
+            SendSignal("SELL", "ASIA_BREAKOUT", symbol, tf, close0, highRange, lowRange);
     }
+}
+
+// === RSI Pullback Strategy ===
+void CheckRSIPullbackSignal(string symbol, int tf)
+{
+	double rsi0 = iRSI(symbol, tf, RSI_Period, PRICE_CLOSE, 0);
+	if(rsi0 <= 0) return;
+
+	double emaFast0, emaSlow0;
+	if(!GetEMAs(symbol, tf, EMA_Fast, EMA_Slow, 0, emaFast0, emaSlow0)) return;
+	bool uptrend = emaFast0 > emaSlow0;
+	bool downtrend = emaFast0 < emaSlow0;
+
+	// BUY pullback: trend up, RSI in 40-50, bullish pattern
+	if(uptrend && rsi0 >= RSI_BuyZone_Low && rsi0 <= RSI_BuyZone_High)
+	{
+		if(IsBullEngulfing(symbol, tf, 0) || IsPinBarBull(symbol, tf, 0))
+		{
+			double price = iClose(symbol, tf, 0);
+			if(!HasOpenOrderForStrategy(symbol, "RSI_PULLBACK"))
+				SendSignal("BUY", "RSI_PULLBACK", symbol, tf, price, rsi0, emaFast0);
+			return;
+		}
+	}
+	// SELL pullback: trend down, RSI in 50-60, bearish pattern
+	if(downtrend && rsi0 >= RSI_SellZone_Low && rsi0 <= RSI_SellZone_High)
+	{
+		if(IsBearEngulfing(symbol, tf, 0) || IsPinBarBear(symbol, tf, 0))
+		{
+			double price = iClose(symbol, tf, 0);
+			if(!HasOpenOrderForStrategy(symbol, "RSI_PULLBACK"))
+				SendSignal("SELL", "RSI_PULLBACK", symbol, tf, price, rsi0, emaFast0);
+			return;
+		}
+	}
+}
+
+// === Asia Breakout Retest Strategy ===
+void CheckAsiaBreakoutRetestSignal(string symbol, int tf)
+{
+	// Reuse Asia session window
+	datetime now = TimeCurrent();
+	datetime sessionStart = ComposeTimeUTC(now, Asia_Session_Start_UTC);
+	datetime sessionEnd   = ComposeTimeUTC(now, Asia_Session_End_UTC);
+	if(TimeCurrent() <= sessionEnd) { sessionStart -= 24*60*60; sessionEnd -= 24*60*60; }
+
+	double highRange = -DBL_MAX;
+	double lowRange  = DBL_MAX;
+	for(int i = 1; i < 500; i++)
+	{
+		datetime bt = iTime(symbol, tf, i);
+		if(bt == 0) break;
+		if(bt < sessionStart) break;
+		if(bt <= sessionEnd && bt >= sessionStart)
+		{
+			double bh = iHigh(symbol, tf, i);
+			double bl = iLow(symbol, tf, i);
+			if(bh > highRange) highRange = bh;
+			if(bl < lowRange)  lowRange  = bl;
+		}
+	}
+	if(highRange == -DBL_MAX || lowRange == DBL_MAX) return;
+
+	double point = MarketInfo(symbol, MODE_POINT);
+	double tol = Retest_Tolerance_Points * point;
+	double atr = iATR(symbol, tf, ATR_Period, 1) / point; // in points
+	if(atr < ATR_Min_Points) return; // need volatility
+
+	double close0 = iClose(symbol, tf, 0);
+
+	// Retest upper: price returns near highRange after prior breakout (close above)
+	bool retestUpper = MathAbs(close0 - highRange) <= tol && close0 > highRange;
+	bool retestLower = MathAbs(close0 - lowRange) <= tol && close0 < lowRange;
+
+	if(retestUpper && (IsBullEngulfing(symbol, tf, 0) || IsPinBarBull(symbol, tf, 0)))
+	{
+		if(!HasOpenOrderForStrategy(symbol, "ASIA_RETEST"))
+			SendSignal("BUY", "ASIA_RETEST", symbol, tf, close0, highRange, atr);
+		return;
+	}
+	if(retestLower && (IsBearEngulfing(symbol, tf, 0) || IsPinBarBear(symbol, tf, 0)))
+	{
+		if(!HasOpenOrderForStrategy(symbol, "ASIA_RETEST"))
+			SendSignal("SELL", "ASIA_RETEST", symbol, tf, close0, lowRange, atr);
+		return;
+	}
+}
+
+// === VWAP Strategy ===
+void CheckVWAPSignal(string symbol, int tf)
+{
+	double vwap;
+	if(!ComputeSessionVWAP(symbol, tf, VWAP_Session_Start_UTC, vwap)) return;
+	double atr = iATR(symbol, tf, VWAP_ATR_Period, 0);
+	if(atr <= 0) return;
+	int digits = (int)MarketInfo(symbol, MODE_DIGITS);
+	double close0 = iClose(symbol, tf, 0);
+	bool bull = IsBullEngulfing(symbol, tf, 0) || IsPinBarBull(symbol, tf, 0);
+	bool bear = IsBearEngulfing(symbol, tf, 0) || IsPinBarBear(symbol, tf, 0);
+
+	// Reversion: price beyond vwap ± 1*ATR and gives reversal trigger back toward mean
+	double lowerRev = vwap - VWAP_Dev_Mult_Reversion * atr;
+	double upperRev = vwap + VWAP_Dev_Mult_Reversion * atr;
+	if(close0 <= lowerRev && bull)
+	{
+		if(!HasOpenOrderForStrategy(symbol, "VWAP_REVERSION"))
+			SendSignal("BUY", "VWAP_REVERSION", symbol, tf, close0, vwap, atr);
+		return;
+	}
+	if(close0 >= upperRev && bear)
+	{
+		if(!HasOpenOrderForStrategy(symbol, "VWAP_REVERSION"))
+			SendSignal("SELL", "VWAP_REVERSION", symbol, tf, close0, vwap, atr);
+		return;
+	}
+
+	// Continuation: price holding beyond vwap ± 2*ATR with momentum candle
+	double lowerCont = vwap - VWAP_Dev_Mult_Continuation * atr;
+	double upperCont = vwap + VWAP_Dev_Mult_Continuation * atr;
+	if(close0 > upperCont && bull)
+	{
+		if(!HasOpenOrderForStrategy(symbol, "VWAP_CONTINUATION"))
+			SendSignal("BUY", "VWAP_CONTINUATION", symbol, tf, close0, vwap, atr);
+		return;
+	}
+	if(close0 < lowerCont && bear)
+	{
+		if(!HasOpenOrderForStrategy(symbol, "VWAP_CONTINUATION"))
+			SendSignal("SELL", "VWAP_CONTINUATION", symbol, tf, close0, vwap, atr);
+		return;
+	}
+}
+
+// === Bollinger Squeeze + Breakout ===
+void CheckBBSqueezeSignal(string symbol, int tf)
+{
+	double upper0 = iBands(symbol, tf, BB_Period, BB_Dev, 0, PRICE_CLOSE, MODE_UPPER, 0);
+	double lower0 = iBands(symbol, tf, BB_Period, BB_Dev, 0, PRICE_CLOSE, MODE_LOWER, 0);
+	double upper1 = iBands(symbol, tf, BB_Period, BB_Dev, 0, PRICE_CLOSE, MODE_UPPER, 1);
+	double lower1 = iBands(symbol, tf, BB_Period, BB_Dev, 0, PRICE_CLOSE, MODE_LOWER, 1);
+	if(upper0 == 0 || lower0 == 0 || upper1 == 0 || lower1 == 0) return;
+	double width0 = upper0 - lower0;
+	double width1 = upper1 - lower1;
+	double point = MarketInfo(symbol, MODE_POINT);
+	if(width1/point > BB_Squeeze_Threshold_Points) return; // not squeezed previously
+	if(width0 <= width1) return; // no expansion yet
+	double close0 = iClose(symbol, tf, 0);
+	if(close0 > upper0)
+	{
+		if(!HasOpenOrderForStrategy(symbol, "BB_SQUEEZE_BREAK"))
+			SendSignal("BUY", "BB_SQUEEZE_BREAK", symbol, tf, close0, width0/point, width1/point);
+		return;
+	}
+	if(close0 < lower0)
+	{
+		if(!HasOpenOrderForStrategy(symbol, "BB_SQUEEZE_BREAK"))
+			SendSignal("SELL", "BB_SQUEEZE_BREAK", symbol, tf, close0, width0/point, width1/point);
+		return;
+	}
+}
+
+// === Keltner vs Bollinger Expansion ===
+void CheckKeltnerExpansionSignal(string symbol, int tf)
+{
+	double ema = iMA(symbol, tf, KC_Period, 0, MODE_EMA, PRICE_CLOSE, 0);
+	double atr = iATR(symbol, tf, KC_ATR_Period, 0);
+	if(ema == 0 || atr == 0) return;
+	double kcUpper = ema + KC_ATR_Mult * atr;
+	double kcLower = ema - KC_ATR_Mult * atr;
+	double bbUpper = iBands(symbol, tf, KC_Period, BB_Dev, 0, PRICE_CLOSE, MODE_UPPER, 0);
+	double bbLower = iBands(symbol, tf, KC_Period, BB_Dev, 0, PRICE_CLOSE, MODE_LOWER, 0);
+	if(bbUpper == 0 || bbLower == 0) return;
+	double close0 = iClose(symbol, tf, 0);
+
+	// Expansion when Bollinger pierces Keltner envelope
+	if(bbUpper > kcUpper && close0 > kcUpper)
+	{
+		if(!HasOpenOrderForStrategy(symbol, "KC_BB_EXPANSION"))
+			SendSignal("BUY", "KC_BB_EXPANSION", symbol, tf, close0, kcUpper, bbUpper);
+		return;
+	}
+	if(bbLower < kcLower && close0 < kcLower)
+	{
+		if(!HasOpenOrderForStrategy(symbol, "KC_BB_EXPANSION"))
+			SendSignal("SELL", "KC_BB_EXPANSION", symbol, tf, close0, kcLower, bbLower);
+		return;
+	}
 }
 
 // Compose a datetime today from HH:MM string in UTC
@@ -392,7 +684,7 @@ void ExecuteTradeCommand(string jsonCommand)
 	price = NormalizeDouble(price, digits);
 
 	// Force SL/TP to zero; EA will send close signals when criteria fail
-	sl = 0; tp = 0;
+	// sl = 0; tp = 0;
 
 	int ticket = OrderSend(symbol, orderType, lots, price, 10, sl, tp, "AutoTrade: " + strategy, 0, 0, clrGreen);
 	if(ticket > 0)
@@ -669,4 +961,221 @@ void SendOrdersStatus()
 	{
 		Print("❌ Orders status WebRequest failed: ", GetLastError());
 	}
+}
+
+void SendAutoCloseSignal(int ticket, string symbol, string side, double openPrice, double currentPrice, string strategy, string reason)
+{
+	string json = "{";
+	json += "\"token\":\"" + Api_Auth_Token + "\",";
+	json += "\"symbol\":\"" + symbol + "\",";
+	json += "\"timeframe\":0,";
+	json += "\"side\":\"CLOSE_" + side + "\",";
+	json += "\"strategy\":\"CLOSE_" + strategy + "\",";
+	json += "\"price\":" + DoubleToString(currentPrice, (int)MarketInfo(symbol, MODE_DIGITS)) + ",";
+	json += "\"ref1\":" + DoubleToString(openPrice, (int)MarketInfo(symbol, MODE_DIGITS)) + ",";
+	json += "\"ref2\":" + DoubleToString(ticket, 0) + ",";
+	json += "\"reason\":\"" + reason + "\",";
+	json += "\"timestamp\":" + IntegerToString((int)TimeCurrent());
+	json += "}";
+
+	char post[]; StringToCharArray(json, post);
+	char result[]; string result_headers = "";
+	ResetLastError();
+	string url = Backend_Base_URL + "/signal";
+	int res = WebRequest("POST", url, "", "", 10000, post, ArraySize(post), result, result_headers);
+	if(res == -1)
+	{
+		Print("❌ Auto-close signal WebRequest failed: ", GetLastError());
+	}
+}
+
+void MonitorOpenOrdersForExit(string symbol, int tf)
+{
+	for(int i = 0; i < OrdersTotal(); i++)
+	{
+		if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+		string osym = OrderSymbol();
+		if(symbol != "" && osym != symbol) continue;
+
+		string comment = OrderComment();
+		if(StringFind(comment, "AutoTrade") < 0) continue;
+		string strategy = comment;
+		int idx = StringFind(strategy, ": ");
+		if(idx >= 0) strategy = StringSubstr(strategy, idx + 2);
+
+		string side = (OrderType() == OP_BUY) ? "BUY" : "SELL";
+		double openPrice = OrderOpenPrice();
+		double curPrice = (OrderType() == OP_BUY) ? MarketInfo(osym, MODE_BID) : MarketInfo(osym, MODE_ASK);
+
+		// Common indicators
+		double emaFast0, emaSlow0; GetEMAs(osym, tf, EMA_Fast, EMA_Slow, 0, emaFast0, emaSlow0);
+		double rsi0 = iRSI(osym, tf, RSI_Period, PRICE_CLOSE, 0);
+
+		bool shouldClose = false;
+		string reason = "";
+
+		if(strategy == "EMA_PULLBACK")
+		{
+			if(side == "BUY" && emaFast0 < emaSlow0) { shouldClose = true; reason = "EMA fast < EMA slow"; }
+			if(side == "SELL" && emaFast0 > emaSlow0) { shouldClose = true; reason = "EMA fast > EMA slow"; }
+		}
+		else if(strategy == "RSI_PULLBACK")
+		{
+			if(side == "BUY")
+			{
+				if(emaFast0 < emaSlow0) { shouldClose = true; reason = "Trend flipped bearish"; }
+				else if(rsi0 >= RSI_SellZone_High) { shouldClose = true; reason = "RSI exited buy zone"; }
+				else if(IsBearEngulfing(osym, tf, 0) || IsPinBarBear(osym, tf, 0)) { shouldClose = true; reason = "Bearish reversal pattern"; }
+			}
+			else // SELL
+			{
+				if(emaFast0 > emaSlow0) { shouldClose = true; reason = "Trend flipped bullish"; }
+				else if(rsi0 <= RSI_BuyZone_Low) { shouldClose = true; reason = "RSI exited sell zone"; }
+				else if(IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0)) { shouldClose = true; reason = "Bullish reversal pattern"; }
+			}
+		}
+		else if(strategy == "ASIA_RETEST")
+		{
+			// Generic reversal confirmation to exit
+			if(side == "BUY" && (IsBearEngulfing(osym, tf, 0) || IsPinBarBear(osym, tf, 0))) { shouldClose = true; reason = "Bearish reversal on retest"; }
+			if(side == "SELL" && (IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0))) { shouldClose = true; reason = "Bullish reversal on retest"; }
+		}
+		else if(strategy == "ASIA_BREAKOUT")
+		{
+			// Recompute Asia range
+			datetime now = TimeCurrent();
+			datetime sessionStart = ComposeTimeUTC(now, Asia_Session_Start_UTC);
+			datetime sessionEnd   = ComposeTimeUTC(now, Asia_Session_End_UTC);
+			if(TimeCurrent() <= sessionEnd) { sessionStart -= 24*60*60; sessionEnd -= 24*60*60; }
+			double highRange = -DBL_MAX; double lowRange = DBL_MAX;
+			for(int k = 1; k < 500; k++)
+			{
+				datetime bt = iTime(osym, tf, k);
+				if(bt == 0) break; if(bt < sessionStart) break;
+				if(bt <= sessionEnd && bt >= sessionStart)
+				{
+					double bh = iHigh(osym, tf, k);
+					double bl = iLow(osym, tf, k);
+					if(bh > highRange) highRange = bh;
+					if(bl < lowRange)  lowRange  = bl;
+				}
+			}
+			if(highRange > -DBL_MAX && lowRange < DBL_MAX)
+			{
+				double tol = Retest_Tolerance_Points * MarketInfo(osym, MODE_POINT);
+				if(side == "BUY")
+				{
+					// If price falls back below Asia high minus tolerance, consider invalid
+					if(curPrice < (highRange - tol)) { shouldClose = true; reason = "Re-entered Asia range (BUY)"; }
+					else if(IsBearEngulfing(osym, tf, 0) || IsPinBarBear(osym, tf, 0)) { shouldClose = true; reason = "Bearish reversal after breakout"; }
+				}
+				else // SELL
+				{
+					if(curPrice > (lowRange + tol)) { shouldClose = true; reason = "Re-entered Asia range (SELL)"; }
+					else if(IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0)) { shouldClose = true; reason = "Bullish reversal after breakout"; }
+				}
+			}
+		}
+		else if(strategy == "VWAP_REVERSION" || strategy == "VWAP_CONTINUATION")
+		{
+			double vwapMon;
+			if(ComputeSessionVWAP(osym, tf, VWAP_Session_Start_UTC, vwapMon))
+			{
+				double atrMon = iATR(osym, tf, VWAP_ATR_Period, 0);
+				if(atrMon > 0)
+				{
+					double contBandUp = vwapMon + VWAP_Dev_Mult_Continuation * atrMon;
+					double contBandDn = vwapMon - VWAP_Dev_Mult_Continuation * atrMon;
+					if(strategy == "VWAP_REVERSION")
+					{
+						// Close when mean reached (crossed VWAP) or opposite reversal
+						if( (side == "BUY"  && curPrice >= vwapMon) || (side == "SELL" && curPrice <= vwapMon) ) { shouldClose = true; reason = "VWAP reached (mean reversion)"; }
+						else if( (side == "BUY"  && (IsBearEngulfing(osym, tf, 0) || IsPinBarBear(osym, tf, 0))) ||
+						         (side == "SELL" && (IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0))) ) { shouldClose = true; reason = "Opposite reversal vs reversion"; }
+					}
+					else // VWAP_CONTINUATION
+					{
+						// Close when price falls back inside vwap±1*ATR equivalent (use continuation band breach as invalidation)
+						if( (side == "BUY"  && curPrice <= contBandUp) || (side == "SELL" && curPrice >= contBandDn) ) { shouldClose = true; reason = "Lost continuation beyond deviation"; }
+						else if( (side == "BUY"  && (IsBearEngulfing(osym, tf, 0) || IsPinBarBear(osym, tf, 0))) ||
+						         (side == "SELL" && (IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0))) ) { shouldClose = true; reason = "Opposite reversal vs continuation"; }
+					}
+				}
+			}
+		}
+		else if(strategy == "BB_SQUEEZE_BREAK")
+		{
+			double bbU = iBands(osym, tf, BB_Period, BB_Dev, 0, PRICE_CLOSE, MODE_UPPER, 0);
+			double bbL = iBands(osym, tf, BB_Period, BB_Dev, 0, PRICE_CLOSE, MODE_LOWER, 0);
+			if(bbU != 0 && bbL != 0)
+			{
+				if( (side == "BUY"  && curPrice < bbU) || (side == "SELL" && curPrice > bbL) ) { shouldClose = true; reason = "Back inside Bollinger band"; }
+				else if( (side == "BUY"  && (IsBearEngulfing(osym, tf, 0) || IsPinBarBear(osym, tf, 0))) ||
+				         (side == "SELL" && (IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0))) ) { shouldClose = true; reason = "Opposite reversal after squeeze"; }
+			}
+		}
+		else if(strategy == "KC_BB_EXPANSION")
+		{
+			double emaMon = iMA(osym, tf, KC_Period, 0, MODE_EMA, PRICE_CLOSE, 0);
+			double atrMon = iATR(osym, tf, KC_ATR_Period, 0);
+			if(emaMon != 0 && atrMon != 0)
+			{
+				double kcUp = emaMon + KC_ATR_Mult * atrMon;
+				double kcDn = emaMon - KC_ATR_Mult * atrMon;
+				// Invalidate momentum when price returns inside Keltner
+				if( (side == "BUY"  && curPrice <= kcUp) || (side == "SELL" && curPrice >= kcDn) ) { shouldClose = true; reason = "Back inside Keltner channel"; }
+				else if( (side == "BUY"  && (IsBearEngulfing(osym, tf, 0) || IsPinBarBear(osym, tf, 0))) ||
+				         (side == "SELL" && (IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0))) ) { shouldClose = true; reason = "Opposite reversal after expansion"; }
+			}
+		}
+
+		if(shouldClose)
+		{
+			SendAutoCloseSignal(OrderTicket(), osym, side, openPrice, curPrice, strategy, reason);
+		}
+	}
+}
+
+// === VWAP helpers ===
+bool ComputeSessionVWAP(string symbol, int tf, string sessionStartUTC, double &vwap)
+{
+	vwap = 0;
+	datetime now = TimeCurrent();
+	datetime sessionStart = ComposeTimeUTC(now, sessionStartUTC);
+	if(TimeCurrent() <= sessionStart) sessionStart -= 24*60*60;
+	double sumPV = 0.0;
+	double sumV  = 0.0;
+	for(int i = 0; i < 1500; i++)
+	{
+		datetime bt = iTime(symbol, tf, i);
+		if(bt == 0) break;
+		if(bt < sessionStart) break;
+		double high = iHigh(symbol, tf, i);
+		double low  = iLow(symbol, tf, i);
+		double close= iClose(symbol, tf, i);
+		double tp = (high + low + close) / 3.0;
+		double vol = iVolume(symbol, tf, i);
+		if(vol <= 0) vol = 1; // fallback for tick volume issues
+		sumPV += tp * vol;
+		sumV  += vol;
+	}
+	if(sumV <= 0) return false;
+	vwap = sumPV / sumV;
+	return true;
+}
+
+bool HasOpenOrderForStrategy(string symbol, string strategy)
+{
+	for(int i = 0; i < OrdersTotal(); i++)
+	{
+		if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+		string osym = OrderSymbol();
+		// allow broker suffix tolerance
+		bool symOk = (osym == symbol) || (StringFind(osym, symbol) >= 0) || (StringFind(symbol, osym) >= 0);
+		if(!symOk) continue;
+		string c = OrderComment();
+		if(StringFind(c, "AutoTrade") >= 0 && StringFind(c, strategy) >= 0)
+			return true;
+	}
+	return false;
 }
