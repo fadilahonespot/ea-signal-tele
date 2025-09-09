@@ -315,7 +315,12 @@ func signalHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ts := time.Unix(p.Timestamp, 0).Format("15:04:05")
+	// Format timestamps in WIB (Asia/Jakarta)
+	loc, err := time.LoadLocation("Asia/Jakarta")
+	if err != nil {
+		loc = time.FixedZone("WIB", 7*60*60)
+	}
+	ts := time.Unix(p.Timestamp, 0).In(loc).Format("15:04:05 WIB")
 
 	// Handle different signal types
 	var msg string

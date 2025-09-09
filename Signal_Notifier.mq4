@@ -125,6 +125,9 @@ bool IsPinBarBear(string symbol, int tf, int shift)
 //=== Globals ===
 datetime g_lastBarTime = 0;
 datetime g_lastHttpPollTime = 0;
+datetime g_lastClosedScanTime = 0;
+int g_closedNotifiedCount = 0;
+int g_closedNotifiedTickets[200];
 
 //+------------------------------------------------------------------+
 //| OnInit                                                           |
@@ -213,6 +216,9 @@ void OnTick()
 
     // Execute incoming trade/close commands from backend
     CheckTradeCommands();
+
+    // Detect closed orders (including SL/TP) and notify backend/Telegram
+    DetectAndNotifyClosedOrders();
 }
 
 //+------------------------------------------------------------------+
@@ -1178,4 +1184,56 @@ bool HasOpenOrderForStrategy(string symbol, string strategy)
 			return true;
 	}
 	return false;
+}
+
+bool WasTicketNotified(int ticket)
+{
+    for(int i = 0; i < g_closedNotifiedCount; i++)
+        if(g_closedNotifiedTickets[i] == ticket) return true;
+    return false;
+}
+
+void MarkTicketNotified(int ticket)
+{
+    // Simple ring buffer of last 200 tickets
+    if(g_closedNotifiedCount < 200)
+    {
+        g_closedNotifiedTickets[g_closedNotifiedCount++] = ticket;
+    }
+    else
+    {
+        // shift left
+        for(int i = 1; i < 200; i++) g_closedNotifiedTickets[i-1] = g_closedNotifiedTickets[i];
+        g_closedNotifiedTickets[199] = ticket;
+    }
+}
+
+void DetectAndNotifyClosedOrders()
+{
+    // Scan history for recently closed EA orders and send confirmation
+    datetime since = TimeCurrent() - 24*60*60; // last 24h window
+    int total = OrdersHistoryTotal();
+    for(int i = total - 1; i >= 0; i--)
+    {
+        if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+        string comment = OrderComment();
+        if(StringFind(comment, "AutoTrade") < 0) continue; // only EA orders
+
+        datetime ctime = OrderCloseTime();
+        if(ctime <= 0 || ctime < since) break; // history is chronological
+
+        int ticket = OrderTicket();
+        if(WasTicketNotified(ticket)) continue;
+
+        string symbol = OrderSymbol();
+        string side = (OrderType() == OP_BUY) ? "BUY" : "SELL";
+        double lots = OrderLots();
+        double openPrice = OrderOpenPrice();
+        double closePrice = OrderClosePrice();
+        double profit = OrderProfit() + OrderSwap() + OrderCommission();
+
+        SendCloseConfirmation(ticket, symbol, side, lots, openPrice, closePrice, profit);
+        MarkTicketNotified(ticket);
+        // Continue scanning in case multiple closed this tick
+    }
 }
