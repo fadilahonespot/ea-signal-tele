@@ -586,6 +586,9 @@ datetime ComposeTimeUTC(datetime baseTime, string hhmm)
 //+------------------------------------------------------------------+
 void SendSignal(string side, string strategy, string symbol, int tf, double price, double ref1, double ref2)
 {
+    // Hitung ATR untuk SL/TP dinamis
+    double atr = iATR(symbol, tf, 14, 0);
+    
     string json = "{";
     json += "\"token\":\"" + Api_Auth_Token + "\",";
     json += "\"symbol\":\"" + symbol + "\",";
@@ -595,6 +598,7 @@ void SendSignal(string side, string strategy, string symbol, int tf, double pric
     json += "\"price\":" + DoubleToString(price, (int)MarketInfo(symbol, MODE_DIGITS)) + ",";
     json += "\"ref1\":" + DoubleToString(ref1, 5) + ",";
     json += "\"ref2\":" + DoubleToString(ref2, 5) + ",";
+    json += "\"atr\":" + DoubleToString(atr, 5) + ",";
     json += "\"timestamp\":" + IntegerToString((int)TimeCurrent());
     json += "}";
 

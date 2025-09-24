@@ -44,6 +44,24 @@ func getEnv(key, defaultVal string) string {
 	return defaultVal
 }
 
+func getEnvInt(key string, defaultVal int) int {
+	if val := os.Getenv(key); val != "" {
+		if intVal, err := strconv.Atoi(val); err == nil {
+			return intVal
+		}
+	}
+	return defaultVal
+}
+
+func getEnvFloat(key string, defaultVal float64) float64 {
+	if val := os.Getenv(key); val != "" {
+		if floatVal, err := strconv.ParseFloat(val, 64); err == nil {
+			return floatVal
+		}
+	}
+	return defaultVal
+}
+
 func getDefaultMT4Path() string {
 	home := os.Getenv("HOME")
 	// Try common MT4 paths
@@ -75,6 +93,7 @@ type SignalPayload struct {
 	Price     float64 `json:"price"`
 	Ref1      float64 `json:"ref1"`
 	Ref2      float64 `json:"ref2"`
+	ATR       float64 `json:"atr,omitempty"`
 	Reason    string  `json:"reason,omitempty"`
 	Timestamp int64   `json:"timestamp"`
 }
@@ -273,6 +292,59 @@ func waitForMT4Response(responseFile string, timeout time.Duration) ([]byte, err
 }
 
 // ============ SIGNAL CALCULATION ============
+type VolatilityConfig struct {
+	ATRPeriod    int     // Periode ATR (default: 14)
+	SLMultiplier float64 // SL = ATR × multiplier (default: 1.5)
+	TPMultiplier float64 // TP = SL × multiplier (default: 2.0)
+	MinSL        float64 // SL minimum dalam pip (default: 0.003 = 3 pip untuk broker 3 digit)
+	MaxSL        float64 // SL maksimum dalam pip (default: 0.020 = 20 pip untuk broker 3 digit)
+}
+
+var volConfig = VolatilityConfig{
+	ATRPeriod:    getEnvInt("ATR_PERIOD", 14),
+	SLMultiplier: getEnvFloat("SL_MULTIPLIER", 1.5),
+	TPMultiplier: getEnvFloat("TP_MULTIPLIER", 2.0),
+	MinSL:        0.003, // 3 pip untuk broker 3 digit (emas)
+	MaxSL:        0.020, // 20 pip untuk broker 3 digit (emas)
+}
+
+// getBrokerDigits - Deteksi digits broker berdasarkan symbol
+func getBrokerDigits(symbol string) int {
+	// Untuk emas, biasanya 3 digit (0.001) atau 2 digit (0.01)
+	if strings.Contains(symbol, "XAU") || strings.Contains(symbol, "GOLD") {
+		// Cek apakah broker menggunakan 2 digit atau 3 digit
+		// Default 3 digit, bisa di-override via env
+		return getEnvInt("GOLD_DIGITS", 3)
+	}
+	// Untuk forex, biasanya 5 digit (0.00001) atau 4 digit (0.0001)
+	return getEnvInt("FOREX_DIGITS", 5)
+}
+
+// getSLTPLimits - Dapatkan limit SL/TP berdasarkan broker digits
+func getSLTPLimits(symbol string) (minSL, maxSL float64) {
+	digits := getBrokerDigits(symbol)
+
+	if strings.Contains(symbol, "XAU") || strings.Contains(symbol, "GOLD") {
+		if digits == 3 {
+			// Broker 3 digit: 1 pip = 0.001
+			return 0.003, 0.020 // 3-20 pip
+		} else {
+			// Broker 2 digit: 1 pip = 0.01
+			return 0.03, 0.20 // 3-20 pip
+		}
+	} else {
+		// Forex
+		if digits == 5 {
+			// Broker 5 digit: 1 pip = 0.00001
+			return 0.00030, 0.00200 // 30-200 pip
+		} else {
+			// Broker 4 digit: 1 pip = 0.0001
+			return 0.0030, 0.0200 // 30-200 pip
+		}
+	}
+}
+
+// calculateSLTP - Fixed SL/TP (fallback)
 func calculateSLTP(symbol, side string, price float64) (sl, tp float64) {
 	var slPips, tpPips float64
 
@@ -291,6 +363,40 @@ func calculateSLTP(symbol, side string, price float64) (sl, tp float64) {
 		sl = price + slPips
 		tp = price - tpPips
 	}
+
+	return sl, tp
+}
+
+// calculateDynamicSLTP - Dynamic SL/TP berdasarkan volatilitas
+func calculateDynamicSLTP(symbol, side string, price float64, atr float64) (sl, tp float64) {
+	// Hitung jarak SL berdasarkan ATR
+	slDistance := atr * volConfig.SLMultiplier
+
+	// Dapatkan limit SL/TP berdasarkan broker digits
+	minSL, maxSL := getSLTPLimits(symbol)
+	brokerDigits := getBrokerDigits(symbol)
+
+	// Batasi SL dalam range yang masuk akal
+	if slDistance < minSL {
+		slDistance = minSL
+	}
+	if slDistance > maxSL {
+		slDistance = maxSL
+	}
+
+	// Hitung TP dengan risk:reward ratio
+	tpDistance := slDistance * volConfig.TPMultiplier
+
+	// Terapkan ke harga
+	if side == "BUY" {
+		sl = price - slDistance
+		tp = price + tpDistance
+	} else {
+		sl = price + slDistance
+		tp = price - tpDistance
+	}
+
+	log.Printf("📊 Dynamic SL/TP: ATR=%.3f, SL_Dist=%.3f, TP_Dist=%.3f, Digits=%d", atr, slDistance, tpDistance, brokerDigits)
 
 	return sl, tp
 }
@@ -335,7 +441,7 @@ func signalHandler(w http.ResponseWriter, r *http.Request) {
 			p.Ref2, p.Symbol, p.Side, lots, p.Price, p.Reason, ts,
 		)
 
-		signalData := fmt.Sprintf("%s|%s|%.2f|%s", p.Symbol, p.Side, p.Price, p.Reason)
+		signalData := fmt.Sprintf("%s|%s|%.2f|%s|%.2f", p.Symbol, p.Side, p.Price, p.Reason, p.ATR)
 		buttons = &TelegramInlineKeyboard{
 			InlineKeyboard: [][]TelegramInlineButton{
 				{
@@ -407,7 +513,7 @@ func signalHandler(w http.ResponseWriter, r *http.Request) {
 			p.Symbol, p.Side, p.Strategy, p.Price, ts,
 		)
 
-		signalData := fmt.Sprintf("%s|%s|%.2f|%s", p.Symbol, p.Side, p.Price, p.Strategy)
+		signalData := fmt.Sprintf("%s|%s|%.2f|%s|%.2f", p.Symbol, p.Side, p.Price, p.Strategy, p.ATR)
 		buttons = &TelegramInlineKeyboard{
 			InlineKeyboard: [][]TelegramInlineButton{
 				{
@@ -494,9 +600,24 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 			strategy := parts[4]
 
 			lots := 0.1
-			sl, tp := calculateSLTP(symbol, side, price)
-
-			log.Printf("🟢 TRADE request: %s %s price=%.2f lots=%.1f sl=%.2f tp=%.2f strat=%s", symbol, side, price, lots, sl, tp, strategy)
+			// Gunakan SL/TP dinamis jika tersedia, fallback ke fixed
+			var sl, tp float64
+			if len(parts) >= 6 {
+				// ATR tersedia dari EA
+				atr, _ := strconv.ParseFloat(parts[5], 64)
+				if atr > 0 {
+					sl, tp = calculateDynamicSLTP(symbol, side, price, atr)
+					log.Printf("🟢 TRADE request (dynamic): %s %s price=%.2f lots=%.1f sl=%.2f tp=%.2f atr=%.2f strat=%s", symbol, side, price, lots, sl, tp, atr, strategy)
+				} else {
+					// ATR invalid, fallback ke fixed
+					sl, tp = calculateSLTP(symbol, side, price)
+					log.Printf("🟢 TRADE request (fixed, invalid ATR): %s %s price=%.2f lots=%.1f sl=%.2f tp=%.2f strat=%s", symbol, side, price, lots, sl, tp, strategy)
+				}
+			} else {
+				// Fallback ke fixed SL/TP
+				sl, tp = calculateSLTP(symbol, side, price)
+				log.Printf("🟢 TRADE request (fixed): %s %s price=%.2f lots=%.1f sl=%.2f tp=%.2f strat=%s", symbol, side, price, lots, sl, tp, strategy)
+			}
 
 			trade := TradeCommand{
 				Action:   "open",
@@ -533,9 +654,24 @@ func handleCallbackQuery(callback *TelegramCallbackQuery) {
 			price, _ := strconv.ParseFloat(parts[4], 64)
 			strategy := parts[5]
 
-			sl, tp := calculateSLTP(symbol, side, price)
-
-			log.Printf("🟢 TRADE request (custom lot): %s %s price=%.2f lots=%.2f sl=%.2f tp=%.2f strat=%s", symbol, side, price, lots, sl, tp, strategy)
+			// Gunakan SL/TP dinamis jika tersedia, fallback ke fixed
+			var sl, tp float64
+			if len(parts) >= 7 {
+				// ATR tersedia dari EA
+				atr, _ := strconv.ParseFloat(parts[6], 64)
+				if atr > 0 {
+					sl, tp = calculateDynamicSLTP(symbol, side, price, atr)
+					log.Printf("🟢 TRADE request (custom lot, dynamic): %s %s price=%.2f lots=%.2f sl=%.2f tp=%.2f atr=%.2f strat=%s", symbol, side, price, lots, sl, tp, atr, strategy)
+				} else {
+					// ATR invalid, fallback ke fixed
+					sl, tp = calculateSLTP(symbol, side, price)
+					log.Printf("🟢 TRADE request (custom lot, fixed, invalid ATR): %s %s price=%.2f lots=%.2f sl=%.2f tp=%.2f strat=%s", symbol, side, price, lots, sl, tp, strategy)
+				}
+			} else {
+				// Fallback ke fixed SL/TP
+				sl, tp = calculateSLTP(symbol, side, price)
+				log.Printf("🟢 TRADE request (custom lot, fixed): %s %s price=%.2f lots=%.2f sl=%.2f tp=%.2f strat=%s", symbol, side, price, lots, sl, tp, strategy)
+			}
 
 			trade := TradeCommand{
 				Action:   "open",
