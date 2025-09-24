@@ -487,10 +487,47 @@ func signalHandler(w http.ResponseWriter, r *http.Request) {
 	} else if strings.HasPrefix(p.Side, "CLOSE_") {
 		// CLOSE SIGNAL
 		actualSide := strings.TrimPrefix(p.Side, "CLOSE_")
-		msg = fmt.Sprintf(
-			"🔴 [CLOSE SIGNAL]\n📊 %s %s\n🎯 %s\n💰 Price: %.2f\n📍 Entry: %.2f\n📝 %s\n🕐 %s",
-			p.Symbol, actualSide, p.Strategy, p.Price, p.Ref1, p.Reason, ts,
-		)
+
+		// Parse P&L dari reason field jika tersedia
+		reasonParts := strings.Split(p.Reason, ";")
+		var floatingPL float64
+		var currency string
+		var reasonText string
+
+		if len(reasonParts) >= 3 {
+			// Format baru: reason;floatingPL;currency
+			reasonText = reasonParts[0]
+			floatingPL, _ = strconv.ParseFloat(reasonParts[1], 64)
+			currency = reasonParts[2]
+		} else {
+			// Format lama: hanya reason
+			reasonText = p.Reason
+		}
+
+		// Format P&L
+		plSign := ""
+		plEmoji := "📈"
+		if floatingPL < 0 {
+			plSign = "-"
+			plEmoji = "📉"
+		} else if floatingPL > 0 {
+			plSign = "+"
+			plEmoji = "📈"
+		}
+
+		// Build message dengan P&L
+		if len(reasonParts) >= 3 {
+			msg = fmt.Sprintf(
+				"🔴 [CLOSE SIGNAL]\n📊 %s %s\n🎯 %s\n💰 Price: %.2f\n📍 Entry: %.2f\n%s P&L: %s%.2f %s\n📝 %s\n🕐 %s",
+				p.Symbol, actualSide, p.Strategy, p.Price, p.Ref1, plEmoji, plSign, floatingPL, currency, reasonText, ts,
+			)
+		} else {
+			// Fallback untuk format lama
+			msg = fmt.Sprintf(
+				"🔴 [CLOSE SIGNAL]\n📊 %s %s\n🎯 %s\n💰 Price: %.2f\n📍 Entry: %.2f\n📝 %s\n🕐 %s",
+				p.Symbol, actualSide, p.Strategy, p.Price, p.Ref1, reasonText, ts,
+			)
+		}
 
 		actualStrategy := strings.TrimPrefix(p.Strategy, "CLOSE_")
 		closeData := fmt.Sprintf("%s|%.0f|%s", p.Symbol, p.Ref2, actualStrategy) // Ref2 = ticket

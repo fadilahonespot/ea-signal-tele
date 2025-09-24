@@ -11,6 +11,14 @@
 input group "=== Strategy Selection ==="
 input bool Enable_EMA_Pullback = true;       // EMA trend + pullback
 input bool Enable_Asia_Breakout = true;      // Asia range breakout
+input bool Enable_Engulfing = true;          // Engulfing pattern
+input bool Enable_Pin_Bar = true;            // Pin bar pattern
+input bool Enable_Volume_Spike = true;       // Volume spike detection
+input bool Enable_London_Open_Breakout = true; // London open breakout
+input bool Enable_Support_Resistance_Bounce = true; // S/R bounce
+input bool Enable_Fibonacci_Retracement = true; // Fibonacci retracement
+input bool Enable_Trend_Line_Break = true;   // Trend line break
+input bool Enable_Volume_Profile_Imbalance = true; // Volume profile imbalance
 
 input group "=== EMA Settings ==="
 input int EMA_Fast = 50;
@@ -129,6 +137,22 @@ datetime g_lastClosedScanTime = 0;
 int g_closedNotifiedCount = 0;
 int g_closedNotifiedTickets[200];
 
+// Dashboard variables
+string g_dashboardObjects[50];
+int g_dashboardObjectCount = 0;
+
+// Config change detection
+bool g_lastEnableEMA = false;
+bool g_lastEnableEngulfing = false;
+bool g_lastEnablePinBar = false;
+bool g_lastEnableVolumeSpike = false;
+bool g_lastEnableAsiaBreakout = false;
+bool g_lastEnableLondonBreakout = false;
+bool g_lastEnableSRBounce = false;
+bool g_lastEnableFibonacci = false;
+bool g_lastEnableTrendLine = false;
+bool g_lastEnableVolumeProfile = false;
+
 //+------------------------------------------------------------------+
 //| OnInit                                                           |
 //+------------------------------------------------------------------+
@@ -148,6 +172,23 @@ int OnInit()
         EventSetTimer(timerSec);
         Print("Timer enabled every ", timerSec, "s (health=", Enable_Health_Ping, ", cmd=", Enable_HTTP_Command_Poll, ")");
     }
+    
+    // Always recreate dashboard panel on init (handles config changes)
+    Print("Creating/refreshing dashboard panel...");
+    CreateDashboardPanel();
+    
+    // Initialize config tracking
+    g_lastEnableEMA = Enable_EMA_Pullback;
+    g_lastEnableEngulfing = Enable_Engulfing;
+    g_lastEnablePinBar = Enable_Pin_Bar;
+    g_lastEnableVolumeSpike = Enable_Volume_Spike;
+    g_lastEnableAsiaBreakout = Enable_Asia_Breakout;
+    g_lastEnableLondonBreakout = Enable_London_Open_Breakout;
+    g_lastEnableSRBounce = Enable_Support_Resistance_Bounce;
+    g_lastEnableFibonacci = Enable_Fibonacci_Retracement;
+    g_lastEnableTrendLine = Enable_Trend_Line_Break;
+    g_lastEnableVolumeProfile = Enable_Volume_Profile_Imbalance;
+    
     return(INIT_SUCCEEDED);
 }
 
@@ -158,6 +199,9 @@ void OnDeinit(const int reason)
 {
     // Kill timer
     EventKillTimer();
+    
+    // Cleanup dashboard
+    CleanupDashboard();
 
     Print("Signal Notifier EA stopped");
 }
@@ -211,14 +255,35 @@ void OnTick()
     if(Enable_KC_BB_Expansion)
         CheckKeltnerExpansionSignal(tradeSymbol, tf);
 
+    // London Open Breakout
+    CheckLondonOpenBreakoutSignal(tradeSymbol, tf);
+
+    // Support/Resistance Bounce
+    CheckSupportResistanceBounceSignal(tradeSymbol, tf);
+
+    // Fibonacci Retracement
+    CheckFibonacciRetracementSignal(tradeSymbol, tf);
+
+    // Trend Line Break
+    CheckTrendLineBreakSignal(tradeSymbol, tf);
+
+    // Volume Profile Imbalance
+    CheckVolumeProfileImbalanceSignal(tradeSymbol, tf);
+
     // Monitor open orders for exit conditions
     MonitorOpenOrdersForExit(tradeSymbol, tf);
 
     // Execute incoming trade/close commands from backend
-    CheckTradeCommands();
+        CheckTradeCommands();
 
     // Detect closed orders (including SL/TP) and notify backend/Telegram
     DetectAndNotifyClosedOrders();
+    
+    // Check for config changes and refresh dashboard if needed
+    CheckConfigChanges();
+    
+    // Update dashboard
+    UpdateDashboard();
 }
 
 //+------------------------------------------------------------------+
@@ -565,6 +630,420 @@ void CheckKeltnerExpansionSignal(string symbol, int tf)
 	}
 }
 
+//+------------------------------------------------------------------+
+//| Check London Open Breakout Signal                               |
+//+------------------------------------------------------------------+
+void CheckLondonOpenBreakoutSignal(string symbol, int tf)
+{
+	// London session: 07:00-09:00 UTC
+	if(!IsInTimeRange("07:00", "09:00")) return;
+	
+	// Cari range London open (2 jam pertama)
+	double londonHigh = 0;
+	double londonLow = 999999;
+	int londonBars = 0;
+	
+	// Hitung berapa bar dalam 2 jam terakhir
+	for(int i = 0; i < 50; i++)
+	{
+		datetime barTime = iTime(symbol, tf, i);
+		if(barTime < TimeCurrent() - 2*3600) break; // 2 jam terakhir
+		
+		double high = iHigh(symbol, tf, i);
+		double low = iLow(symbol, tf, i);
+		
+		if(high > londonHigh) londonHigh = high;
+		if(low < londonLow) londonLow = low;
+		londonBars++;
+	}
+	
+	if(londonBars < 5) return; // Minimal 5 bar
+	
+	double close0 = iClose(symbol, tf, 0);
+	double point = MarketInfo(symbol, MODE_POINT);
+	double breakoutBuffer = 300 * point; // 300 points buffer
+	
+	// Breakout dengan volume confirmation
+	double currentVolume = iVolume(symbol, tf, 0);
+	double avgVolume = 0;
+	for(int i = 1; i <= 10; i++)
+		avgVolume += iVolume(symbol, tf, i);
+	avgVolume /= 10;
+	
+	// Breakout up dengan volume
+	if(close0 > londonHigh + breakoutBuffer && currentVolume > avgVolume * 1.2)
+	{
+		if(!HasOpenOrderForStrategy(symbol, "LONDON_OPEN_BREAKOUT"))
+			SendSignal("BUY", "LONDON_OPEN_BREAKOUT", symbol, tf, close0, londonHigh, londonLow);
+		return;
+	}
+	
+	// Breakout down dengan volume
+	if(close0 < londonLow - breakoutBuffer && currentVolume > avgVolume * 1.2)
+	{
+		if(!HasOpenOrderForStrategy(symbol, "LONDON_OPEN_BREAKOUT"))
+			SendSignal("SELL", "LONDON_OPEN_BREAKOUT", symbol, tf, close0, londonHigh, londonLow);
+		return;
+	}
+}
+
+//+------------------------------------------------------------------+
+//| Check Support/Resistance Bounce Signal                          |
+//+------------------------------------------------------------------+
+void CheckSupportResistanceBounceSignal(string symbol, int tf)
+{
+	// Cari level support/resistance dalam 50 bar terakhir
+	double supportLevel = 0;
+	double resistanceLevel = 0;
+	int supportTouches = 0;
+	int resistanceTouches = 0;
+	
+	// Cari swing points
+	for(int i = 5; i < 50; i++)
+	{
+		double high = iHigh(symbol, tf, i);
+		double low = iLow(symbol, tf, i);
+		
+		// Cek apakah ini swing high
+		bool isSwingHigh = true;
+		for(int j = 1; j <= 3; j++)
+		{
+			if(iHigh(symbol, tf, i-j) >= high || iHigh(symbol, tf, i+j) >= high)
+			{
+				isSwingHigh = false;
+				break;
+			}
+		}
+		
+		// Cek apakah ini swing low
+		bool isSwingLow = true;
+		for(int j = 1; j <= 3; j++)
+		{
+			if(iLow(symbol, tf, i-j) <= low || iLow(symbol, tf, i+j) <= low)
+			{
+				isSwingLow = false;
+				break;
+			}
+		}
+		
+		if(isSwingHigh)
+		{
+			if(resistanceLevel == 0) resistanceLevel = high;
+			else if(MathAbs(high - resistanceLevel) < 100 * MarketInfo(symbol, MODE_POINT))
+			{
+				resistanceTouches++;
+			}
+		}
+		
+		if(isSwingLow)
+		{
+			if(supportLevel == 0) supportLevel = low;
+			else if(MathAbs(low - supportLevel) < 100 * MarketInfo(symbol, MODE_POINT))
+			{
+				supportTouches++;
+			}
+		}
+	}
+	
+	if(supportTouches < 2 && resistanceTouches < 2) return;
+	
+	double close0 = iClose(symbol, tf, 0);
+	double point = MarketInfo(symbol, MODE_POINT);
+	double bounceTolerance = 200 * point; // 200 points tolerance
+	
+	// Bounce dari support dengan bullish pattern
+	if(supportTouches >= 2 && MathAbs(close0 - supportLevel) < bounceTolerance)
+	{
+		if(IsBullEngulfing(symbol, tf, 0) || IsPinBarBull(symbol, tf, 0))
+		{
+			if(!HasOpenOrderForStrategy(symbol, "SUPPORT_RESISTANCE_BOUNCE"))
+				SendSignal("BUY", "SUPPORT_RESISTANCE_BOUNCE", symbol, tf, close0, supportLevel, resistanceLevel);
+			return;
+		}
+	}
+	
+	// Bounce dari resistance dengan bearish pattern
+	if(resistanceTouches >= 2 && MathAbs(close0 - resistanceLevel) < bounceTolerance)
+	{
+		if(IsBearEngulfing(symbol, tf, 0) || IsPinBarBear(symbol, tf, 0))
+		{
+			if(!HasOpenOrderForStrategy(symbol, "SUPPORT_RESISTANCE_BOUNCE"))
+				SendSignal("SELL", "SUPPORT_RESISTANCE_BOUNCE", symbol, tf, close0, supportLevel, resistanceLevel);
+			return;
+		}
+	}
+}
+
+//+------------------------------------------------------------------+
+//| Check Fibonacci Retracement Signal                               |
+//+------------------------------------------------------------------+
+void CheckFibonacciRetracementSignal(string symbol, int tf)
+{
+	// Cari swing high/low dalam 50 bar terakhir
+	double swingHigh = 0;
+	double swingLow = 999999;
+	int swingHighBar = 0;
+	int swingLowBar = 0;
+	
+	// Cari swing points
+	for(int i = 10; i < 50; i++)
+	{
+		double high = iHigh(symbol, tf, i);
+		double low = iLow(symbol, tf, i);
+		
+		// Cek swing high (5 bar terendah di kiri-kanan)
+		bool isSwingHigh = true;
+		for(int j = 1; j <= 5; j++)
+		{
+			if(iHigh(symbol, tf, i-j) >= high || iHigh(symbol, tf, i+j) >= high)
+			{
+				isSwingHigh = false;
+				break;
+			}
+		}
+		
+		// Cek swing low (5 bar tertinggi di kiri-kanan)
+		bool isSwingLow = true;
+		for(int j = 1; j <= 5; j++)
+		{
+			if(iLow(symbol, tf, i-j) <= low || iLow(symbol, tf, i+j) <= low)
+			{
+				isSwingLow = false;
+				break;
+			}
+		}
+		
+		if(isSwingHigh && high > swingHigh)
+		{
+			swingHigh = high;
+			swingHighBar = i;
+		}
+		
+		if(isSwingLow && low < swingLow)
+		{
+			swingLow = low;
+			swingLowBar = i;
+		}
+	}
+	
+	if(swingHigh == 0 || swingLow == 999999) return;
+	if(swingHighBar == 0 || swingLowBar == 0) return;
+	
+	// Pastikan swing high lebih baru dari swing low
+	if(swingHighBar > swingLowBar) return;
+	
+	double close0 = iClose(symbol, tf, 0);
+	double point = MarketInfo(symbol, MODE_POINT);
+	double fibTolerance = 150 * point; // 150 points tolerance
+	
+	// Hitung Fibonacci levels
+	double range = swingHigh - swingLow;
+	double fib236 = swingHigh - range * 0.236;
+	double fib382 = swingHigh - range * 0.382;
+	double fib500 = swingHigh - range * 0.500;
+	double fib618 = swingHigh - range * 0.618;
+	
+	// Bounce dari Fibonacci level dengan bullish pattern
+	if(MathAbs(close0 - fib382) < fibTolerance)
+	{
+		if(IsBullEngulfing(symbol, tf, 0) || IsPinBarBull(symbol, tf, 0))
+		{
+			if(!HasOpenOrderForStrategy(symbol, "FIBONACCI_RETRACEMENT"))
+				SendSignal("BUY", "FIBONACCI_RETRACEMENT", symbol, tf, close0, fib382, swingHigh);
+			return;
+		}
+	}
+	
+	if(MathAbs(close0 - fib500) < fibTolerance)
+	{
+		if(IsBullEngulfing(symbol, tf, 0) || IsPinBarBull(symbol, tf, 0))
+		{
+			if(!HasOpenOrderForStrategy(symbol, "FIBONACCI_RETRACEMENT"))
+				SendSignal("BUY", "FIBONACCI_RETRACEMENT", symbol, tf, close0, fib500, swingHigh);
+			return;
+		}
+	}
+	
+	if(MathAbs(close0 - fib618) < fibTolerance)
+	{
+		if(IsBullEngulfing(symbol, tf, 0) || IsPinBarBull(symbol, tf, 0))
+		{
+			if(!HasOpenOrderForStrategy(symbol, "FIBONACCI_RETRACEMENT"))
+				SendSignal("BUY", "FIBONACCI_RETRACEMENT", symbol, tf, close0, fib618, swingHigh);
+			return;
+		}
+	}
+}
+
+//+------------------------------------------------------------------+
+//| Check Trend Line Break Signal                                   |
+//+------------------------------------------------------------------+
+void CheckTrendLineBreakSignal(string symbol, int tf)
+{
+	// Cari trend line dari swing points
+	double trendLineSlope = 0;
+	double trendLineValue = 0;
+	int trendLineTouches = 0;
+	
+	// Cari swing points untuk trend line
+	double swingPoints[10][2]; // [price, bar_index]
+	int swingCount = 0;
+	
+	for(int i = 10; i < 50; i++)
+	{
+		double high = iHigh(symbol, tf, i);
+		double low = iLow(symbol, tf, i);
+		
+		// Cek swing high
+		bool isSwingHigh = true;
+		for(int j = 1; j <= 3; j++)
+		{
+			if(iHigh(symbol, tf, i-j) >= high || iHigh(symbol, tf, i+j) >= high)
+			{
+				isSwingHigh = false;
+				break;
+			}
+		}
+		
+		// Cek swing low
+		bool isSwingLow = true;
+		for(int j = 1; j <= 3; j++)
+		{
+			if(iLow(symbol, tf, i-j) <= low || iLow(symbol, tf, i+j) <= low)
+			{
+				isSwingLow = false;
+				break;
+			}
+		}
+		
+		if(isSwingHigh && swingCount < 10)
+		{
+			swingPoints[swingCount][0] = high;
+			swingPoints[swingCount][1] = i;
+			swingCount++;
+		}
+		
+		if(isSwingLow && swingCount < 10)
+		{
+			swingPoints[swingCount][0] = low;
+			swingPoints[swingCount][1] = i;
+			swingCount++;
+		}
+	}
+	
+	if(swingCount < 3) return;
+	
+	// Cari trend line yang paling banyak touch
+	for(int i = 0; i < swingCount - 1; i++)
+	{
+		for(int j = i + 1; j < swingCount; j++)
+		{
+			double slope = (swingPoints[i][0] - swingPoints[j][0]) / (swingPoints[i][1] - swingPoints[j][1]);
+			double currentValue = swingPoints[i][0] - slope * swingPoints[i][1];
+			
+			int touches = 2; // i dan j
+			
+			// Hitung berapa banyak swing point yang dekat dengan trend line
+			for(int k = 0; k < swingCount; k++)
+			{
+				if(k == i || k == j) continue;
+				double lineValue = currentValue + slope * swingPoints[k][1];
+				if(MathAbs(swingPoints[k][0] - lineValue) < 100 * MarketInfo(symbol, MODE_POINT))
+				{
+					touches++;
+				}
+			}
+			
+			if(touches > trendLineTouches)
+			{
+				trendLineTouches = touches;
+				trendLineSlope = slope;
+				trendLineValue = currentValue;
+			}
+		}
+	}
+	
+	if(trendLineTouches < 3) return; // Minimal 3 touch
+	
+	double close0 = iClose(symbol, tf, 0);
+	double point = MarketInfo(symbol, MODE_POINT);
+	double breakBuffer = 200 * point; // 200 points buffer
+	
+	// Hitung nilai trend line di bar saat ini
+	double currentTrendLineValue = trendLineValue + trendLineSlope * 0;
+	
+	// Break trend line dengan volume
+	double currentVolume = iVolume(symbol, tf, 0);
+	double avgVolume = 0;
+	for(int i = 1; i <= 10; i++)
+		avgVolume += iVolume(symbol, tf, i);
+	avgVolume /= 10;
+	
+	// Breakout up dengan volume
+	if(close0 > currentTrendLineValue + breakBuffer && currentVolume > avgVolume * 1.1)
+	{
+		if(!HasOpenOrderForStrategy(symbol, "TREND_LINE_BREAK"))
+			SendSignal("BUY", "TREND_LINE_BREAK", symbol, tf, close0, currentTrendLineValue, trendLineSlope);
+		return;
+	}
+	
+	// Breakout down dengan volume
+	if(close0 < currentTrendLineValue - breakBuffer && currentVolume > avgVolume * 1.1)
+	{
+		if(!HasOpenOrderForStrategy(symbol, "TREND_LINE_BREAK"))
+			SendSignal("SELL", "TREND_LINE_BREAK", symbol, tf, close0, currentTrendLineValue, trendLineSlope);
+		return;
+	}
+}
+
+//+------------------------------------------------------------------+
+//| Check Volume Profile Imbalance Signal                           |
+//+------------------------------------------------------------------+
+void CheckVolumeProfileImbalanceSignal(string symbol, int tf)
+{
+	// Hitung volume profile dalam 20 bar terakhir
+	double avgVolume = 0;
+	double maxVolume = 0;
+	int maxVolumeBar = 0;
+	
+	for(int i = 0; i < 20; i++)
+	{
+		double volume = iVolume(symbol, tf, i);
+		avgVolume += volume;
+		if(volume > maxVolume)
+		{
+			maxVolume = volume;
+			maxVolumeBar = i;
+		}
+	}
+	avgVolume /= 20;
+	
+	// Deteksi volume spike (2x rata-rata)
+	if(maxVolume < avgVolume * 2.0) return;
+	
+	// Volume spike harus di bar terbaru (0-2 bar)
+	if(maxVolumeBar > 2) return;
+	
+	double close0 = iClose(symbol, tf, 0);
+	double close1 = iClose(symbol, tf, 1);
+	double atr = iATR(symbol, tf, 14, 0);
+	
+	// Volume spike dengan price movement yang signifikan
+	if(close0 > close1 + atr * 0.3) // Price naik 30% ATR
+	{
+		if(!HasOpenOrderForStrategy(symbol, "VOLUME_PROFILE_IMBALANCE"))
+			SendSignal("BUY", "VOLUME_PROFILE_IMBALANCE", symbol, tf, close0, maxVolume, avgVolume);
+		return;
+	}
+	
+	if(close0 < close1 - atr * 0.3) // Price turun 30% ATR
+	{
+		if(!HasOpenOrderForStrategy(symbol, "VOLUME_PROFILE_IMBALANCE"))
+			SendSignal("SELL", "VOLUME_PROFILE_IMBALANCE", symbol, tf, close0, maxVolume, avgVolume);
+		return;
+	}
+}
+
 // Compose a datetime today from HH:MM string in UTC
 datetime ComposeTimeUTC(datetime baseTime, string hhmm)
 {
@@ -579,6 +1058,21 @@ datetime ComposeTimeUTC(datetime baseTime, string hhmm)
     // This assumes terminal server time aligned with UTC; brokers differ.
     // For most use, the relative window works well enough.
     return(StringToTime(ts));
+}
+
+// Check if current time is within specified time range (UTC)
+bool IsInTimeRange(string startTime, string endTime)
+{
+    datetime now = TimeCurrent();
+    datetime start = ComposeTimeUTC(now, startTime);
+    datetime end = ComposeTimeUTC(now, endTime);
+    
+    if(start == 0 || end == 0) return false;
+    
+    // Handle case where end time is next day (e.g., 23:00 to 01:00)
+    if(end <= start) end += 24*60*60;
+    
+    return (now >= start && now <= end);
 }
 
 //+------------------------------------------------------------------+
@@ -975,6 +1469,13 @@ void SendOrdersStatus()
 
 void SendAutoCloseSignal(int ticket, string symbol, string side, double openPrice, double currentPrice, string strategy, string reason)
 {
+	// Hitung P&L floating
+	double floatingPL = 0;
+	if(OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES))
+	{
+		floatingPL = OrderProfit() + OrderSwap() + OrderCommission();
+	}
+	
 	string json = "{";
 	json += "\"token\":\"" + Api_Auth_Token + "\",";
 	json += "\"symbol\":\"" + symbol + "\",";
@@ -984,7 +1485,7 @@ void SendAutoCloseSignal(int ticket, string symbol, string side, double openPric
 	json += "\"price\":" + DoubleToString(currentPrice, (int)MarketInfo(symbol, MODE_DIGITS)) + ",";
 	json += "\"ref1\":" + DoubleToString(openPrice, (int)MarketInfo(symbol, MODE_DIGITS)) + ",";
 	json += "\"ref2\":" + DoubleToString(ticket, 0) + ",";
-	json += "\"reason\":\"" + reason + "\",";
+	json += "\"reason\":\"" + reason + ";" + DoubleToString(floatingPL, 2) + ";" + AccountCurrency() + "\",";
 	json += "\"timestamp\":" + IntegerToString((int)TimeCurrent());
 	json += "}";
 
@@ -1138,6 +1639,164 @@ void MonitorOpenOrdersForExit(string symbol, int tf)
 				         (side == "SELL" && (IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0))) ) { shouldClose = true; reason = "Opposite reversal after expansion"; }
 			}
 		}
+		else if(strategy == "LONDON_OPEN_BREAKOUT")
+		{
+			// Close when London session ends (09:00 UTC) or opposite reversal
+			if(!IsInTimeRange("07:00", "09:00"))
+			{
+				shouldClose = true;
+				reason = "London session ended";
+			}
+			else if( (side == "BUY"  && (IsBearEngulfing(osym, tf, 0) || IsPinBarBear(osym, tf, 0))) ||
+			         (side == "SELL" && (IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0))) )
+			{
+				shouldClose = true;
+				reason = "Opposite reversal after London breakout";
+			}
+		}
+		else if(strategy == "SUPPORT_RESISTANCE_BOUNCE")
+		{
+			// Close when price moves away from S/R level or opposite reversal
+			double point = MarketInfo(osym, MODE_POINT);
+			double tolerance = 300 * point; // 300 points tolerance
+			
+			// Cari level S/R terdekat
+			double nearestSR = 0;
+			bool isNearSR = false;
+			
+			// Cari swing points untuk S/R
+			for(int i = 5; i < 50; i++)
+			{
+				double high = iHigh(osym, tf, i);
+				double low = iLow(osym, tf, i);
+				
+				if(MathAbs(curPrice - high) < tolerance || MathAbs(curPrice - low) < tolerance)
+				{
+					nearestSR = (MathAbs(curPrice - high) < MathAbs(curPrice - low)) ? high : low;
+					isNearSR = true;
+					break;
+				}
+			}
+			
+			// Close jika sudah jauh dari S/R level
+			if(!isNearSR || MathAbs(curPrice - nearestSR) > tolerance * 2)
+			{
+				shouldClose = true;
+				reason = "Moved away from S/R level";
+			}
+			else if( (side == "BUY"  && (IsBearEngulfing(osym, tf, 0) || IsPinBarBear(osym, tf, 0))) ||
+			         (side == "SELL" && (IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0))) )
+			{
+				shouldClose = true;
+				reason = "Opposite reversal at S/R level";
+			}
+		}
+		else if(strategy == "FIBONACCI_RETRACEMENT")
+		{
+			// Close ketika harga sudah jauh dari Fibonacci level atau reversal
+			double point = MarketInfo(osym, MODE_POINT);
+			double tolerance = 300 * point; // 300 points tolerance
+			
+			// Cari Fibonacci level terdekat
+			double nearestFib = 0;
+			bool isNearFib = false;
+			
+			// Cari swing high/low untuk Fibonacci
+			double swingHigh = 0;
+			double swingLow = 999999;
+			for(int i = 10; i < 50; i++)
+			{
+				double high = iHigh(osym, tf, i);
+				double low = iLow(osym, tf, i);
+				if(high > swingHigh) swingHigh = high;
+				if(low < swingLow) swingLow = low;
+			}
+			
+			if(swingHigh > 0 && swingLow < 999999)
+			{
+				double range = swingHigh - swingLow;
+				double fib382 = swingHigh - range * 0.382;
+				double fib500 = swingHigh - range * 0.500;
+				double fib618 = swingHigh - range * 0.618;
+				
+				// Cek level Fibonacci terdekat
+				if(MathAbs(curPrice - fib382) < tolerance) { nearestFib = fib382; isNearFib = true; }
+				else if(MathAbs(curPrice - fib500) < tolerance) { nearestFib = fib500; isNearFib = true; }
+				else if(MathAbs(curPrice - fib618) < tolerance) { nearestFib = fib618; isNearFib = true; }
+			}
+			
+			// Close jika sudah jauh dari Fibonacci level
+			if(!isNearFib || MathAbs(curPrice - nearestFib) > tolerance * 2)
+			{
+				shouldClose = true;
+				reason = "Moved away from Fibonacci level";
+			}
+			else if( (side == "BUY"  && (IsBearEngulfing(osym, tf, 0) || IsPinBarBear(osym, tf, 0))) ||
+			         (side == "SELL" && (IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0))) )
+			{
+				shouldClose = true;
+				reason = "Opposite reversal at Fibonacci level";
+			}
+		}
+		else if(strategy == "TREND_LINE_BREAK")
+		{
+			// Close ketika harga kembali ke trend line atau reversal
+			double point = MarketInfo(osym, MODE_POINT);
+			double tolerance = 250 * point; // 250 points tolerance
+			
+			// Cari trend line terdekat (simplified)
+			double nearestTrendLine = 0;
+			bool isNearTrendLine = false;
+			
+			// Cari swing points untuk trend line
+			for(int i = 5; i < 30; i++)
+			{
+				double high = iHigh(osym, tf, i);
+				double low = iLow(osym, tf, i);
+				
+				if(MathAbs(curPrice - high) < tolerance || MathAbs(curPrice - low) < tolerance)
+				{
+					nearestTrendLine = (MathAbs(curPrice - high) < MathAbs(curPrice - low)) ? high : low;
+					isNearTrendLine = true;
+					break;
+				}
+			}
+			
+			// Close jika kembali ke trend line
+			if(isNearTrendLine && MathAbs(curPrice - nearestTrendLine) < tolerance)
+			{
+				shouldClose = true;
+				reason = "Returned to trend line";
+			}
+			else if( (side == "BUY"  && (IsBearEngulfing(osym, tf, 0) || IsPinBarBear(osym, tf, 0))) ||
+			         (side == "SELL" && (IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0))) )
+			{
+				shouldClose = true;
+				reason = "Opposite reversal after trend break";
+			}
+		}
+		else if(strategy == "VOLUME_PROFILE_IMBALANCE")
+		{
+			// Close ketika volume kembali normal atau reversal
+			double currentVolume = iVolume(osym, tf, 0);
+			double avgVolume = 0;
+			for(int i = 1; i <= 10; i++)
+				avgVolume += iVolume(osym, tf, i);
+			avgVolume /= 10;
+			
+			// Close jika volume sudah kembali normal
+			if(currentVolume < avgVolume * 1.5) // Volume turun ke 1.5x rata-rata
+			{
+				shouldClose = true;
+				reason = "Volume returned to normal";
+			}
+			else if( (side == "BUY"  && (IsBearEngulfing(osym, tf, 0) || IsPinBarBear(osym, tf, 0))) ||
+			         (side == "SELL" && (IsBullEngulfing(osym, tf, 0) || IsPinBarBull(osym, tf, 0))) )
+			{
+				shouldClose = true;
+				reason = "Opposite reversal after volume spike";
+			}
+		}
 
 		if(shouldClose)
 		{
@@ -1240,4 +1899,389 @@ void DetectAndNotifyClosedOrders()
         MarkTicketNotified(ticket);
         // Continue scanning in case multiple closed this tick
     }
+}
+
+//+------------------------------------------------------------------+
+//| Dashboard Functions                                               |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| CreateDashboardPanel - Create the main dashboard panel           |
+//+------------------------------------------------------------------+
+void CreateDashboardPanel()
+{
+    // Cleanup existing objects first
+    CleanupDashboard();
+    
+    // Main panel background
+    string panelName = "EA_Dashboard_Panel";
+    ObjectCreate(panelName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSet(panelName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSet(panelName, OBJPROP_XDISTANCE, 10);
+    ObjectSet(panelName, OBJPROP_YDISTANCE, 30);
+    ObjectSet(panelName, OBJPROP_XSIZE, 320);
+    ObjectSet(panelName, OBJPROP_YSIZE, 400);
+    ObjectSet(panelName, OBJPROP_BGCOLOR, C'15,15,25');
+    ObjectSet(panelName, OBJPROP_BORDER_COLOR, C'60,60,80');
+    ObjectSet(panelName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+    ObjectSet(panelName, OBJPROP_WIDTH, 2);
+    ObjectSet(panelName, OBJPROP_BACK, false);
+    ObjectSet(panelName, OBJPROP_SELECTABLE, false);
+    ObjectSet(panelName, OBJPROP_HIDDEN, true);
+    g_dashboardObjects[g_dashboardObjectCount++] = panelName;
+    
+    // Title
+    string titleName = "EA_Dashboard_Title";
+    ObjectCreate(titleName, OBJ_LABEL, 0, 0, 0);
+    ObjectSet(titleName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSet(titleName, OBJPROP_XDISTANCE, 20);
+    ObjectSet(titleName, OBJPROP_YDISTANCE, 40);
+    ObjectSetText(titleName, "EA SIGNAL DASHBOARD", 12, "Arial Bold", C'255,255,255');
+    ObjectSet(titleName, OBJPROP_SELECTABLE, false);
+    ObjectSet(titleName, OBJPROP_HIDDEN, true);
+    g_dashboardObjects[g_dashboardObjectCount++] = titleName;
+    
+    // Status line
+    string statusName = "EA_Dashboard_Status";
+    ObjectCreate(statusName, OBJ_LABEL, 0, 0, 0);
+    ObjectSet(statusName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSet(statusName, OBJPROP_XDISTANCE, 20);
+    ObjectSet(statusName, OBJPROP_YDISTANCE, 65);
+    ObjectSetText(statusName, "Status: Active", 10, "Arial", C'0,255,0');
+    ObjectSet(statusName, OBJPROP_SELECTABLE, false);
+    ObjectSet(statusName, OBJPROP_HIDDEN, true);
+    g_dashboardObjects[g_dashboardObjectCount++] = statusName;
+    
+    // Active strategies section
+    string strategiesTitleName = "EA_Dashboard_Strategies_Title";
+    ObjectCreate(strategiesTitleName, OBJ_LABEL, 0, 0, 0);
+    ObjectSet(strategiesTitleName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSet(strategiesTitleName, OBJPROP_XDISTANCE, 20);
+    ObjectSet(strategiesTitleName, OBJPROP_YDISTANCE, 90);
+    ObjectSetText(strategiesTitleName, "Active Strategies:", 10, "Arial Bold", C'255,255,255');
+    ObjectSet(strategiesTitleName, OBJPROP_SELECTABLE, false);
+    ObjectSet(strategiesTitleName, OBJPROP_HIDDEN, true);
+    g_dashboardObjects[g_dashboardObjectCount++] = strategiesTitleName;
+    
+    // Strategy status lines (will be updated dynamically)
+    for(int i = 0; i < 15; i++)
+    {
+        string strategyName = "EA_Dashboard_Strategy_" + IntegerToString(i);
+        ObjectCreate(strategyName, OBJ_LABEL, 0, 0, 0);
+        ObjectSet(strategyName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+        ObjectSet(strategyName, OBJPROP_XDISTANCE, 30);
+        ObjectSet(strategyName, OBJPROP_YDISTANCE, 110 + i * 14);
+        ObjectSetText(strategyName, "", 9, "Arial", C'200,200,200');
+        ObjectSet(strategyName, OBJPROP_SELECTABLE, false);
+        ObjectSet(strategyName, OBJPROP_HIDDEN, true);
+        g_dashboardObjects[g_dashboardObjectCount++] = strategyName;
+    }
+    
+    // Orders section
+    string ordersTitleName = "EA_Dashboard_Orders_Title";
+    ObjectCreate(ordersTitleName, OBJ_LABEL, 0, 0, 0);
+    ObjectSet(ordersTitleName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSet(ordersTitleName, OBJPROP_XDISTANCE, 20);
+    ObjectSet(ordersTitleName, OBJPROP_YDISTANCE, 330);
+    ObjectSetText(ordersTitleName, "Open Orders:", 10, "Arial Bold", C'255,255,255');
+    ObjectSet(ordersTitleName, OBJPROP_SELECTABLE, false);
+    ObjectSet(ordersTitleName, OBJPROP_HIDDEN, true);
+    g_dashboardObjects[g_dashboardObjectCount++] = ordersTitleName;
+    
+    // Orders info
+    string ordersInfoName = "EA_Dashboard_Orders_Info";
+    ObjectCreate(ordersInfoName, OBJ_LABEL, 0, 0, 0);
+    ObjectSet(ordersInfoName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSet(ordersInfoName, OBJPROP_XDISTANCE, 30);
+    ObjectSet(ordersInfoName, OBJPROP_YDISTANCE, 350);
+    ObjectSetText(ordersInfoName, "Total: 0", 9, "Arial", C'200,200,200');
+    ObjectSet(ordersInfoName, OBJPROP_SELECTABLE, false);
+    ObjectSet(ordersInfoName, OBJPROP_HIDDEN, true);
+    g_dashboardObjects[g_dashboardObjectCount++] = ordersInfoName;
+    
+    Print("Dashboard panel created with ", g_dashboardObjectCount, " objects");
+}
+
+//+------------------------------------------------------------------+
+//| UpdateDashboard - Update dashboard information                   |
+//+------------------------------------------------------------------+
+void UpdateDashboard()
+{
+    if(g_dashboardObjectCount == 0) return;
+    
+    // Update status
+    string statusText = "Status: Active | Time: " + TimeToStr(TimeCurrent(), TIME_MINUTES);
+    ObjectSetText("EA_Dashboard_Status", statusText, 10, "Arial", C'0,255,0');
+    
+    // Get strategy status with order counts
+    string strategies[20];
+    int strategyCount = 0;
+    bool strategyEnabled[20];
+    
+    if(Enable_EMA_Pullback) { strategies[strategyCount] = "EMA Pullback"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_Engulfing) { strategies[strategyCount] = "Engulfing"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_Pin_Bar) { strategies[strategyCount] = "Pin Bar"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_Volume_Spike) { strategies[strategyCount] = "Volume Spike"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_Asia_Breakout) { strategies[strategyCount] = "Asia Breakout"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_London_Open_Breakout) { strategies[strategyCount] = "London Breakout"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_Support_Resistance_Bounce) { strategies[strategyCount] = "S/R Bounce"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_Fibonacci_Retracement) { strategies[strategyCount] = "Fibonacci"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_Trend_Line_Break) { strategies[strategyCount] = "Trend Line"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_Volume_Profile_Imbalance) { strategies[strategyCount] = "Volume Profile"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    
+    // Add additional strategies that might have orders
+    if(Enable_KC_BB_Expansion) { strategies[strategyCount] = "KC BB Expansion"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_BB_Squeeze) { strategies[strategyCount] = "BB Squeeze Break"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_VWAP) { strategies[strategyCount] = "VWAP Reversion"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_Asia_Retest) { strategies[strategyCount] = "Asia Retest"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    if(Enable_RSI_Pullback) { strategies[strategyCount] = "RSI Pullback"; strategyEnabled[strategyCount] = true; strategyCount++; }
+    
+    // Add disabled strategies
+    if(!Enable_EMA_Pullback) { strategies[strategyCount] = "EMA Pullback"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_Engulfing) { strategies[strategyCount] = "Engulfing"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_Pin_Bar) { strategies[strategyCount] = "Pin Bar"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_Volume_Spike) { strategies[strategyCount] = "Volume Spike"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_Asia_Breakout) { strategies[strategyCount] = "Asia Breakout"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_London_Open_Breakout) { strategies[strategyCount] = "London Breakout"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_Support_Resistance_Bounce) { strategies[strategyCount] = "S/R Bounce"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_Fibonacci_Retracement) { strategies[strategyCount] = "Fibonacci"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_Trend_Line_Break) { strategies[strategyCount] = "Trend Line"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_Volume_Profile_Imbalance) { strategies[strategyCount] = "Volume Profile"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    
+    // Add disabled additional strategies
+    if(!Enable_KC_BB_Expansion) { strategies[strategyCount] = "KC BB Expansion"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_BB_Squeeze) { strategies[strategyCount] = "BB Squeeze Break"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_VWAP) { strategies[strategyCount] = "VWAP Reversion"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_Asia_Retest) { strategies[strategyCount] = "Asia Retest"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    if(!Enable_RSI_Pullback) { strategies[strategyCount] = "RSI Pullback"; strategyEnabled[strategyCount] = false; strategyCount++; }
+    
+    Print("DEBUG: Total strategies found: ", strategyCount);
+    
+    // If no strategies found, add some basic ones to show
+    if(strategyCount == 0)
+    {
+        Print("DEBUG: No strategies found, adding basic ones");
+        strategies[strategyCount] = "EMA Pullback"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "Engulfing"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "Pin Bar"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "Volume Spike"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "Asia Breakout"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "London Breakout"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "S/R Bounce"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "Fibonacci"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "Trend Line"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "Volume Profile"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "KC BB Expansion"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "BB Squeeze Break"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "VWAP Reversion"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "Asia Retest"; strategyEnabled[strategyCount] = false; strategyCount++;
+        strategies[strategyCount] = "RSI Pullback"; strategyEnabled[strategyCount] = false; strategyCount++;
+        Print("DEBUG: Added basic strategies, total now: ", strategyCount);
+    }
+    
+    // Update strategy status with order counts
+    for(int i = 0; i < 15 && i < strategyCount; i++)
+    {
+        string strategyName = "EA_Dashboard_Strategy_" + IntegerToString(i);
+        string status = "";
+        color statusColor = C'200,200,200';
+        
+        Print("DEBUG: Processing strategy ", i, ": ", strategies[i], " enabled: ", strategyEnabled[i]);
+        
+        // Count orders for this strategy
+        string strategyCode = GetStrategyCode(strategies[i]);
+        Print("DEBUG: Looking for strategy: ", strategies[i], " -> code: ", strategyCode);
+        int orderCount = CountOrdersForStrategy(strategyCode);
+        
+        if(strategyEnabled[i])
+        {
+            status = "[ON] " + strategies[i] + " - " + IntegerToString(orderCount) + " orders";
+            statusColor = C'0,255,0';
+        }
+        else
+        {
+            status = "[OFF] " + strategies[i] + " - " + IntegerToString(orderCount) + " orders";
+            statusColor = C'255,100,100';
+        }
+        
+        ObjectSetText(strategyName, status, 9, "Arial", statusColor);
+    }
+    
+    // Update orders info
+    int totalOrders = OrdersTotal();
+    int eaOrders = 0;
+    double totalProfit = 0;
+    
+    for(int i = 0; i < totalOrders; i++)
+    {
+        if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+        string comment = OrderComment();
+        if(StringFind(comment, "AutoTrade") >= 0)
+        {
+            eaOrders++;
+            totalProfit += OrderProfit() + OrderSwap() + OrderCommission();
+        }
+    }
+    
+    string ordersText = "Total: " + IntegerToString(totalOrders) + " | EA: " + IntegerToString(eaOrders);
+    if(eaOrders > 0)
+    {
+        ordersText += " | P&L: " + DoubleToString(totalProfit, 2);
+    }
+    
+    color profitColor = C'200,200,200';
+    if(totalProfit > 0) profitColor = C'0,255,0';
+    else if(totalProfit < 0) profitColor = C'255,0,0';
+    
+    ObjectSetText("EA_Dashboard_Orders_Info", ordersText, 9, "Arial", profitColor);
+}
+
+//+------------------------------------------------------------------+
+//| CountOrdersForStrategy - Count orders for specific strategy      |
+//+------------------------------------------------------------------+
+int CountOrdersForStrategy(string strategy)
+{
+    int count = 0;
+    int total = OrdersTotal();
+    
+    Print("DEBUG: Counting orders for strategy: ", strategy, " (Total orders: ", total, ")");
+    
+    for(int i = 0; i < total; i++)
+    {
+        if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) 
+        {
+            Print("DEBUG: Failed to select order ", i);
+            continue;
+        }
+        
+        string comment = OrderComment();
+        Print("DEBUG: Order ", i, " comment: '", comment, "'");
+        
+        // Check if this order belongs to the strategy
+        if(StringFind(comment, "AutoTrade") >= 0)
+        {
+            Print("DEBUG: Found AutoTrade order: ", comment);
+            // Extract strategy from comment
+            string orderStrategy = ExtractStrategyFromComment(comment);
+            Print("DEBUG: Extracted strategy: '", orderStrategy, "' vs looking for: '", strategy, "'");
+            
+            if(orderStrategy == strategy)
+            {
+                count++;
+                Print("DEBUG: Match found! Count now: ", count);
+            }
+            else
+            {
+                Print("DEBUG: No match - orderStrategy='", orderStrategy, "' strategy='", strategy, "'");
+            }
+        }
+        else
+        {
+            Print("DEBUG: Order ", i, " is not AutoTrade order");
+        }
+    }
+    
+    Print("DEBUG: Final count for strategy '", strategy, "': ", count);
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| GetStrategyCode - Convert display name to strategy code          |
+//+------------------------------------------------------------------+
+string GetStrategyCode(string displayName)
+{
+    if(displayName == "EMA Pullback") return "EMA_PULLBACK";
+    if(displayName == "Engulfing") return "ENGULFING";
+    if(displayName == "Pin Bar") return "PIN_BAR";
+    if(displayName == "Volume Spike") return "VOLUME_SPIKE";
+    if(displayName == "Asia Breakout") return "ASIA_BREAKOUT";
+    if(displayName == "London Breakout") return "LONDON_OPEN_BREAKOUT";
+    if(displayName == "S/R Bounce") return "SUPPORT_RESISTANCE_BOUNCE";
+    if(displayName == "Fibonacci") return "FIBONACCI_RETRACEMENT";
+    if(displayName == "Trend Line") return "TREND_LINE_BREAK";
+    if(displayName == "Volume Profile") return "VOLUME_PROFILE_IMBALANCE";
+    
+    // Additional strategies that might be used
+    if(displayName == "RSI Pullback") return "RSI_PULLBACK";
+    if(displayName == "Asia Retest") return "ASIA_RETEST";
+    if(displayName == "VWAP Reversion") return "VWAP_REVERSION";
+    if(displayName == "VWAP Continuation") return "VWAP_CONTINUATION";
+    if(displayName == "BB Squeeze Break") return "BB_SQUEEZE_BREAK";
+    if(displayName == "KC BB Expansion") return "KC_BB_EXPANSION";
+    
+    return displayName;
+}
+
+//+------------------------------------------------------------------+
+//| ExtractStrategyFromComment - Extract strategy name from comment  |
+//+------------------------------------------------------------------+
+string ExtractStrategyFromComment(string comment)
+{
+    Print("DEBUG: Extracting strategy from comment: '", comment, "'");
+    
+    // Comment format: "AutoTrade: STRATEGY_NAME"
+    if(StringFind(comment, "AutoTrade: ") == 0)
+    {
+        string strategy = StringSubstr(comment, 11); // Remove "AutoTrade: "
+        Print("DEBUG: Extracted strategy: '", strategy, "'");
+        return strategy;
+    }
+    
+    // Try alternative format: "AutoTrade_STRATEGY_NAME"
+    if(StringFind(comment, "AutoTrade_") == 0)
+    {
+        string strategy = StringSubstr(comment, 10); // Remove "AutoTrade_"
+        Print("DEBUG: Extracted strategy (alt format): '", strategy, "'");
+        return strategy;
+    }
+    
+    Print("DEBUG: No AutoTrade prefix found in comment");
+    return "";
+}
+
+//+------------------------------------------------------------------+
+//| CheckConfigChanges - Detect config changes and refresh dashboard  |
+//+------------------------------------------------------------------+
+void CheckConfigChanges()
+{
+    bool configChanged = false;
+    
+    if(g_lastEnableEMA != Enable_EMA_Pullback) { g_lastEnableEMA = Enable_EMA_Pullback; configChanged = true; }
+    if(g_lastEnableEngulfing != Enable_Engulfing) { g_lastEnableEngulfing = Enable_Engulfing; configChanged = true; }
+    if(g_lastEnablePinBar != Enable_Pin_Bar) { g_lastEnablePinBar = Enable_Pin_Bar; configChanged = true; }
+    if(g_lastEnableVolumeSpike != Enable_Volume_Spike) { g_lastEnableVolumeSpike = Enable_Volume_Spike; configChanged = true; }
+    if(g_lastEnableAsiaBreakout != Enable_Asia_Breakout) { g_lastEnableAsiaBreakout = Enable_Asia_Breakout; configChanged = true; }
+    if(g_lastEnableLondonBreakout != Enable_London_Open_Breakout) { g_lastEnableLondonBreakout = Enable_London_Open_Breakout; configChanged = true; }
+    if(g_lastEnableSRBounce != Enable_Support_Resistance_Bounce) { g_lastEnableSRBounce = Enable_Support_Resistance_Bounce; configChanged = true; }
+    if(g_lastEnableFibonacci != Enable_Fibonacci_Retracement) { g_lastEnableFibonacci = Enable_Fibonacci_Retracement; configChanged = true; }
+    if(g_lastEnableTrendLine != Enable_Trend_Line_Break) { g_lastEnableTrendLine = Enable_Trend_Line_Break; configChanged = true; }
+    if(g_lastEnableVolumeProfile != Enable_Volume_Profile_Imbalance) { g_lastEnableVolumeProfile = Enable_Volume_Profile_Imbalance; configChanged = true; }
+    
+    if(configChanged)
+    {
+        Print("Config change detected, refreshing dashboard...");
+        RefreshDashboard();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| RefreshDashboard - Force refresh dashboard panel                 |
+//+------------------------------------------------------------------+
+void RefreshDashboard()
+{
+    Print("Refreshing dashboard panel...");
+    CleanupDashboard();
+    CreateDashboardPanel();
+}
+
+//+------------------------------------------------------------------+
+//| CleanupDashboard - Remove all dashboard objects                  |
+//+------------------------------------------------------------------+
+void CleanupDashboard()
+{
+    for(int i = 0; i < g_dashboardObjectCount; i++)
+    {
+        ObjectDelete(g_dashboardObjects[i]);
+    }
+    g_dashboardObjectCount = 0;
 }
