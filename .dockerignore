@@ -1,0 +1,40 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+README.md
+*.md
+
+# IDE files
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+telegram-trading-system/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs
+*.log
+logs/
+
+# Environment files (will be set via Render)
+.env
+.env.local
+.env.production
+
+# MT4 files (will be created at runtime)
+mt4-files/
+
+# Temporary files
+tmp/
+temp/

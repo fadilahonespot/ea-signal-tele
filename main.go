@@ -63,6 +63,12 @@ func getEnvFloat(key string, defaultVal float64) float64 {
 }
 
 func getDefaultMT4Path() string {
+	// Check if MT4_DATA_PATH is set (for Render deployment)
+	if mt4Path := os.Getenv("MT4_DATA_PATH"); mt4Path != "" {
+		os.MkdirAll(mt4Path, 0755)
+		return mt4Path
+	}
+
 	home := os.Getenv("HOME")
 	// Try common MT4 paths
 	paths := []string{
