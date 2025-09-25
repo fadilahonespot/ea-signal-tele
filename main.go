@@ -349,8 +349,17 @@ func calculateSLTP(symbol, side string, price float64) (sl, tp float64) {
 	var slPips, tpPips float64
 
 	if strings.Contains(symbol, "XAU") || strings.Contains(symbol, "GOLD") {
-		slPips = 5.0  // $5.00 for gold
-		tpPips = 10.0 // $10.00 for gold
+		// Use broker-appropriate SL/TP for gold
+		digits := getBrokerDigits(symbol)
+		if digits == 3 {
+			// Broker 3 digit: 1 pip = 0.001
+			slPips = 0.010 // 10 pip = $10 for gold (3-digit)
+			tpPips = 0.020 // 20 pip = $20 for gold (3-digit)
+		} else {
+			// Broker 2 digit: 1 pip = 0.01
+			slPips = 0.10 // 10 pip = $10 for gold (2-digit)
+			tpPips = 0.20 // 20 pip = $20 for gold (2-digit)
+		}
 	} else {
 		slPips = 0.0050 // 50 pips for forex (5-digit)
 		tpPips = 0.0100 // 100 pips for forex
@@ -363,6 +372,8 @@ func calculateSLTP(symbol, side string, price float64) (sl, tp float64) {
 		sl = price + slPips
 		tp = price - tpPips
 	}
+
+	log.Printf("📊 Fixed SL/TP: Symbol=%s, Digits=%d, SL_Dist=%.3f, TP_Dist=%.3f", symbol, getBrokerDigits(symbol), slPips, tpPips)
 
 	return sl, tp
 }

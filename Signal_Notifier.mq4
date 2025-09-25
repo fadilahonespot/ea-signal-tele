@@ -1167,6 +1167,8 @@ void ExecuteTradeCommand(string jsonCommand)
 	double sl = StringToDouble(ExtractJSONValue(jsonCommand, "sl"));
 	double tp = StringToDouble(ExtractJSONValue(jsonCommand, "tp"));
 	string strategy = ExtractJSONValue(jsonCommand, "strategy");
+	
+	Print("🔍 Trade parameters: Symbol=", symbol, " Side=", side, " Lots=", lots, " SL=", sl, " TP=", tp, " Strategy=", strategy);
 
 	if(symbol == "" || (side != "BUY" && side != "SELL") || lots <= 0)
 	{
@@ -1175,9 +1177,19 @@ void ExecuteTradeCommand(string jsonCommand)
 	}
 
 	int orderType = (side == "BUY") ? OP_BUY : OP_SELL;
+	
+	// Refresh rates to ensure latest quotes
+	RefreshRates();
 	double price = (orderType == OP_BUY) ? MarketInfo(symbol, MODE_ASK) : MarketInfo(symbol, MODE_BID);
+	
+	// Validate price
+	if(price <= 0)
+	{
+		Print("❌ Invalid price: ", price, " for symbol: ", symbol);
+		return;
+	}
 
-	// Normalize lot and price only; do not set SL/TP (managed by close signals)
+	// Normalize lot and price
 	int digits = (int)MarketInfo(symbol, MODE_DIGITS);
 	double minLot = MarketInfo(symbol, MODE_MINLOT);
 	double maxLot = MarketInfo(symbol, MODE_MAXLOT);
@@ -1187,8 +1199,54 @@ void ExecuteTradeCommand(string jsonCommand)
 	if(lots > maxLot) lots = maxLot;
 	price = NormalizeDouble(price, digits);
 
-	// Force SL/TP to zero; EA will send close signals when criteria fail
-	// sl = 0; tp = 0;
+	// Validate and adjust SL/TP to prevent Error 130 (Invalid stops)
+	double point = MarketInfo(symbol, MODE_POINT);
+	double minStopLevel = MarketInfo(symbol, MODE_STOPLEVEL) * point;
+	double spread = MarketInfo(symbol, MODE_SPREAD) * point;
+	
+	Print("🔍 Broker info: Point=", point, " StopLevel=", minStopLevel, " Spread=", spread);
+	
+	// Ensure minimum distance for SL/TP - use larger buffer for gold
+	double minDistance = MathMax(minStopLevel, spread * 3);
+	if(StringFind(symbol, "XAU") >= 0 || StringFind(symbol, "GOLD") >= 0)
+	{
+		// For gold, ensure minimum 15 points distance
+		minDistance = MathMax(minDistance, 0.015);
+	}
+	
+	Print("🔍 MinDistance=", minDistance, " Original SL=", sl, " Original TP=", tp);
+	
+	if(sl > 0)
+	{
+		double slDistance = MathAbs(price - sl);
+		if(slDistance < minDistance)
+		{
+			double newSL = (orderType == OP_BUY) ? price - minDistance : price + minDistance;
+			Print("⚠️ SL too close (", slDistance, " < ", minDistance, "), adjusting from ", sl, " to ", newSL);
+			sl = NormalizeDouble(newSL, digits);
+		}
+		else
+		{
+			Print("✅ SL distance OK: ", slDistance, " >= ", minDistance);
+		}
+	}
+	
+	if(tp > 0)
+	{
+		double tpDistance = MathAbs(price - tp);
+		if(tpDistance < minDistance)
+		{
+			double newTP = (orderType == OP_BUY) ? price + minDistance : price - minDistance;
+			Print("⚠️ TP too close (", tpDistance, " < ", minDistance, "), adjusting from ", tp, " to ", newTP);
+			tp = NormalizeDouble(newTP, digits);
+		}
+		else
+		{
+			Print("✅ TP distance OK: ", tpDistance, " >= ", minDistance);
+		}
+	}
+	
+	Print("🔍 Final SL/TP: SL=", sl, " TP=", tp);
 
 	int ticket = OrderSend(symbol, orderType, lots, price, 10, sl, tp, "AutoTrade: " + strategy, 0, 0, clrGreen);
 	if(ticket > 0)
